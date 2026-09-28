@@ -218,7 +218,8 @@ func TestReconcileHalfDoneDestroy(t *testing.T) {
 	}
 }
 
-// TestReconcileRunningMissingBackend Running 记录但后端整体消失 -> 隔离，不自动重建。
+// TestReconcileRunningMissingBackend Running 记录但后端整体消失
+// -> 持久化挂起为 ManualReview（不自动重建），占用继续计入，常规变更随后被拒。
 func TestReconcileRunningMissingBackend(t *testing.T) {
 	ctx := context.Background()
 	e := newEnv(t, domain.Resources{CPUMillis: 8000, MemoryMB: 4096, DiskMB: 16384})
@@ -233,24 +234,46 @@ func TestReconcileRunningMissingBackend(t *testing.T) {
 	if err := e.h.Undefine(ctx, "lost"); err != nil {
 		t.Fatal(err)
 	}
-	// 重新写回 Running 记录（Undefine 本身不动记录，这里记录本就还是 Running）。
 
 	rep := e.reconcile(t)
 	v := findVerdict(rep, "lost")
 	if v.Outcome != reconcile.OutcomeQuarantined {
 		t.Fatalf("ambiguous loss must quarantine, got %s (%s)", v.Outcome, v.Detail)
 	}
-	got, _ := e.st.Get(ctx, "lost")
-	if got.State != domain.StateRunning {
-		t.Fatalf("quarantine must NOT overwrite record, got %s", got.State)
+	if v.After != "ManualReview" {
+		t.Fatalf("verdict after must be ManualReview, got %q", v.After)
 	}
-	// 被隔离实例不纳入台账重建 -> 其配额被显式摘出等待裁决，避免漂移。
-	if _, ok := e.o.ResourceSnapshot().Reservations["lost"]; ok {
-		t.Fatal("quarantined instance must be excluded from rebuilt ledger until resolved")
+	// 结论必须持久化到记录上，而不是只活在本次报告里。
+	got, _ := e.st.Get(ctx, "lost")
+	if got.State != domain.StateManualReview {
+		t.Fatalf("record must be persisted as ManualReview, got %s", got.State)
+	}
+	if got.Review == nil || got.Review.Reason != domain.ReviewRunningMissingBackend {
+		t.Fatalf("persisted review reason missing: %+v", got.Review)
+	}
+	if !got.Review.SpecKnown {
+		t.Fatal("record-origin review must know spec")
+	}
+	// 新口径：待人工处理实例继续占用，防止裁决前资源被再次分配；收口 discard 时才释放。
+	if res, ok := e.o.ResourceSnapshot().Reservations["lost"]; !ok || res != spec.Resources {
+		t.Fatalf("manual-review instance must keep reservation, got ok=%v res=%+v", ok, res)
+	}
+	// 常规变更一律拒绝，且原因为可区分的 manual_review_pending。
+	if _, err := e.o.Start(ctx, "lost"); !domain.IsKind(err, domain.KindManualReviewPending) {
+		t.Fatalf("start on held instance must be manual_review_pending, got %v", err)
+	}
+	if _, err := e.o.Destroy(ctx, "lost"); !domain.IsKind(err, domain.KindManualReviewPending) {
+		t.Fatalf("destroy on held instance must be manual_review_pending, got %v", err)
+	}
+	// 后端承载缺失必须原样保留（本场景无残留），且状态未被拒绝操作覆盖。
+	got2, _ := e.st.Get(ctx, "lost")
+	if got2.State != domain.StateManualReview {
+		t.Fatalf("state must remain ManualReview after rejected ops, got %s", got2.State)
 	}
 }
 
-// TestReconcileOrphanBackend 后端残留无记录 -> 孤儿隔离，绝不静默删除。
+// TestReconcileOrphanBackend 后端残留无记录 -> 持久化挂起为 ManualReview 孤儿，
+// 残留绝不删除，规格可知时占用继续计入台账。
 func TestReconcileOrphanBackend(t *testing.T) {
 	ctx := context.Background()
 	e := newEnv(t, domain.Resources{CPUMillis: 8000, MemoryMB: 4096, DiskMB: 16384})
@@ -272,12 +295,37 @@ func TestReconcileOrphanBackend(t *testing.T) {
 	if !found {
 		t.Fatalf("orphan must be reported: %+v", rep.Orphans)
 	}
+	// 残留必须原样保留（仍在跑），不得被顺手清掉。
 	info, _ := e.h.Inspect(ctx, "orphan")
 	if info.Status != backend.StatusRunning {
 		t.Fatalf("orphan residue must be preserved, not killed: %+v", info)
 	}
+	// 结论必须落盘：新进程能查到 ManualReview 记录与原因。
+	rec, err := e.st.Get(ctx, "orphan")
+	if err != nil {
+		t.Fatalf("orphan must get a persisted record: %v", err)
+	}
+	if rec.State != domain.StateManualReview || rec.Review == nil ||
+		rec.Review.Reason != domain.ReviewOrphanBackend {
+		t.Fatalf("orphan record must be ManualReview with reason: %+v", rec)
+	}
+	// 规格可知（sim 后端带规格）：占用继续计入。
+	if res, ok := e.o.ResourceSnapshot().Reservations["orphan"]; !ok || res != spec.Resources {
+		t.Fatalf("spec-known orphan must count toward usage, got ok=%v res=%+v", ok, res)
+	}
 	if rep.QuotaConverged != true {
-		t.Fatal("ledger with no alive records should still converge to empty")
+		t.Fatal("ledger must converge")
+	}
+
+	// 再跑一次对账：冻结态必须保持，不能重复创建/覆盖，也不能自动收口。
+	rep2 := e.reconcile(t)
+	v := findVerdict(rep2, "orphan")
+	if v.Outcome != reconcile.OutcomeQuarantined || v.Action != "held-pending-manual-resolution" {
+		t.Fatalf("repeat reconcile must keep holding: %+v", v)
+	}
+	rec2, _ := e.st.Get(ctx, "orphan")
+	if rec2.State != domain.StateManualReview {
+		t.Fatalf("held state must survive repeat reconcile, got %s", rec2.State)
 	}
 }
 
@@ -368,15 +416,21 @@ func TestReconcileMixedDeterministic(t *testing.T) {
 			t.Errorf("id=%s outcome=%s want %s", id, got, want)
 		}
 	}
-	// 配额守恒：defined1 + crash1 + startwin1 = 3 台存活；
-	// halfkill1 收敛 Destroyed（释放）；ambiguous1 隔离（摘出）；orphan1 无记录不占配额。
+	// 配额守恒（新口径：ManualReview 也继续占用）：
+	// defined1 + crash1 + startwin1 三台正常存活；halfkill1 收敛 Destroyed（释放）；
+	// ambiguous1 持久化 ManualReview 但继续占用；orphan1 落盘 ManualReview 且规格可知，也占用。
 	snap := e.o.ResourceSnapshot()
-	wantUsed := domain.Resources{CPUMillis: 3000, MemoryMB: 1536, DiskMB: 3072}
+	wantUsed := domain.Resources{CPUMillis: 5000, MemoryMB: 2560, DiskMB: 5120}
 	if snap.Used != wantUsed {
 		t.Fatalf("ledger after mixed reconcile wrong: got %+v want %+v", snap.Used, wantUsed)
 	}
-	if len(snap.Reservations) != 3 {
+	if len(snap.Reservations) != 5 {
 		t.Fatalf("reservations = %v", snap.Reservations)
 	}
-	t.Logf("[snapshot] mixed reconcile settled: used=%+v reservations=%d", snap.Used, len(snap.Reservations))
+	// 持久化的待人工处理集合。
+	if len(rep.ManualReviewIDs) != 2 {
+		t.Fatalf("manualReview ids = %v", rep.ManualReviewIDs)
+	}
+	t.Logf("[snapshot] mixed reconcile settled: used=%+v reservations=%d manualReview=%v",
+		snap.Used, len(snap.Reservations), rep.ManualReviewIDs)
 }

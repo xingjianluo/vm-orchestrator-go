@@ -28,6 +28,7 @@ type simEntry struct {
 type SimHandle struct {
 	mu      sync.Mutex
 	entries map[string]*simEntry
+	hooksMu sync.RWMutex
 	hooks   FaultHooks
 }
 
@@ -38,13 +39,58 @@ func NewSimHandle(hooks FaultHooks) *SimHandle {
 	}
 }
 
+// SetHooks 替换故障钩子（主要供测试动态注入阻塞/故障），与钩子触发并发安全。
+func (h *SimHandle) SetHooks(hooks FaultHooks) {
+	h.hooksMu.Lock()
+	defer h.hooksMu.Unlock()
+	h.hooks = hooks
+}
+
+func (h *SimHandle) fireDefine(id string) error {
+	h.hooksMu.RLock()
+	f := h.hooks.BeforeDefine
+	h.hooksMu.RUnlock()
+	if f != nil {
+		return f(id)
+	}
+	return nil
+}
+
+func (h *SimHandle) fireStart(id string) error {
+	h.hooksMu.RLock()
+	f := h.hooks.BeforeStart
+	h.hooksMu.RUnlock()
+	if f != nil {
+		return f(id)
+	}
+	return nil
+}
+
+func (h *SimHandle) fireStop(id string) error {
+	h.hooksMu.RLock()
+	f := h.hooks.BeforeStop
+	h.hooksMu.RUnlock()
+	if f != nil {
+		return f(id)
+	}
+	return nil
+}
+
+func (h *SimHandle) fireUndefine(id string) error {
+	h.hooksMu.RLock()
+	f := h.hooks.BeforeUndefine
+	h.hooksMu.RUnlock()
+	if f != nil {
+		return f(id)
+	}
+	return nil
+}
+
 func (h *SimHandle) Name() string { return "sim" }
 
 func (h *SimHandle) Define(ctx context.Context, id string, spec domain.Spec) error {
-	if h.hooks.BeforeDefine != nil {
-		if err := h.hooks.BeforeDefine(id); err != nil {
-			return err
-		}
+	if err := h.fireDefine(id); err != nil {
+		return err
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -56,10 +102,8 @@ func (h *SimHandle) Define(ctx context.Context, id string, spec domain.Spec) err
 }
 
 func (h *SimHandle) Start(ctx context.Context, id string) error {
-	if h.hooks.BeforeStart != nil {
-		if err := h.hooks.BeforeStart(id); err != nil {
-			return err
-		}
+	if err := h.fireStart(id); err != nil {
+		return err
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -72,10 +116,8 @@ func (h *SimHandle) Start(ctx context.Context, id string) error {
 }
 
 func (h *SimHandle) Stop(ctx context.Context, id string) error {
-	if h.hooks.BeforeStop != nil {
-		if err := h.hooks.BeforeStop(id); err != nil {
-			return err
-		}
+	if err := h.fireStop(id); err != nil {
+		return err
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -90,10 +132,8 @@ func (h *SimHandle) Stop(ctx context.Context, id string) error {
 }
 
 func (h *SimHandle) Undefine(ctx context.Context, id string) error {
-	if h.hooks.BeforeUndefine != nil {
-		if err := h.hooks.BeforeUndefine(id); err != nil {
-			return err
-		}
+	if err := h.fireUndefine(id); err != nil {
+		return err
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -109,7 +149,7 @@ func (h *SimHandle) Inspect(ctx context.Context, id string) (Info, error) {
 	if !ok {
 		return Info{ID: id, Status: StatusAbsent}, nil
 	}
-	return Info{ID: id, Status: e.status, Detail: "simulated"}, nil
+	return Info{ID: id, Status: e.status, Detail: "simulated", Spec: e.spec, HasSpec: true}, nil
 }
 
 func (h *SimHandle) List(ctx context.Context) ([]Info, error) {
@@ -117,7 +157,7 @@ func (h *SimHandle) List(ctx context.Context) ([]Info, error) {
 	defer h.mu.Unlock()
 	out := make([]Info, 0, len(h.entries))
 	for id, e := range h.entries {
-		out = append(out, Info{ID: id, Status: e.status, Detail: "simulated"})
+		out = append(out, Info{ID: id, Status: e.status, Detail: "simulated", Spec: e.spec, HasSpec: true})
 	}
 	return out, nil
 }

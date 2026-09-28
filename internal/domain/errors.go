@@ -16,6 +16,9 @@ const (
 	KindBackendFailure       ErrorKind = "backend_failure"
 	KindInconsistentState    ErrorKind = "inconsistent_state"
 	KindInvalidArgument      ErrorKind = "invalid_argument"
+	// KindManualReviewPending 实例处于待人工处理冻结态：常规变更被拒，
+	// 必须先经人工显式收口（resolve adopt / resolve discard）。
+	KindManualReviewPending ErrorKind = "manual_review_pending"
 )
 
 // OpError 携带可区分的错误类别与上下文。
@@ -101,4 +104,13 @@ func NewInvalidArgumentError(op, reason string) error {
 
 func NewInconsistentStateError(op, id, reason string) error {
 	return &OpError{Kind: KindInconsistentState, Op: op, InstanceID: id, Reason: reason}
+}
+
+// NewManualReviewPendingError 构造"待人工处理"拒绝错误，携带判定原因便于调用方区分。
+func NewManualReviewPendingError(op, id string, rv *Review) error {
+	reason := "instance is held for manual review; use resolve adopt/resolve discard"
+	if rv != nil {
+		reason += " (reason=" + string(rv.Reason) + ": " + rv.Detail + ")"
+	}
+	return &OpError{Kind: KindManualReviewPending, Op: op, InstanceID: id, Reason: reason}
 }

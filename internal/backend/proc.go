@@ -200,15 +200,26 @@ func (h *ProcHandle) Inspect(ctx context.Context, id string) (Info, error) {
 	if _, err := os.Stat(dir); os.IsNotExist(err) {
 		return Info{ID: id, Status: StatusAbsent}, nil
 	}
+	info := Info{ID: id}
+	// 规格是承载事实的一部分：孤儿残留也应能读出规格用于占用台账。
+	if spec, err := h.readSpecLocked(id); err == nil {
+		info.Spec = spec
+		info.HasSpec = true
+	}
 	h.mu.Lock()
 	pid, hasPid := h.readPidLocked(id)
 	sess, hasSess := h.live[id]
 	h.mu.Unlock()
 	if !hasPid {
-		return Info{ID: id, Status: StatusStopped, Detail: "defined, not running"}, nil
+		info.Status = StatusStopped
+		info.Detail = "defined, not running"
+		return info, nil
 	}
 	if processAlive(pid) {
-		return Info{ID: id, Status: StatusRunning, Pid: pid, Detail: "alive"}, nil
+		info.Status = StatusRunning
+		info.Pid = pid
+		info.Detail = "alive"
+		return info, nil
 	}
 	if hasSess {
 		select {
@@ -216,7 +227,23 @@ func (h *ProcHandle) Inspect(ctx context.Context, id string) (Info, error) {
 		default:
 		}
 	}
-	return Info{ID: id, Status: StatusStopped, Pid: pid, Detail: "stale pid file: guest exited abnormally (crash or kill -9)"}, nil
+	info.Status = StatusStopped
+	info.Pid = pid
+	info.Detail = "stale pid file: guest exited abnormally (crash or kill -9)"
+	return info, nil
+}
+
+// readSpecLocked 读取承载目录中的 spec.json；文件缺失或损坏时返回错误。
+func (h *ProcHandle) readSpecLocked(id string) (domain.Spec, error) {
+	data, err := os.ReadFile(filepath.Join(h.instDir(id), "spec.json"))
+	if err != nil {
+		return domain.Spec{}, err
+	}
+	var spec domain.Spec
+	if err := json.Unmarshal(data, &spec); err != nil {
+		return domain.Spec{}, err
+	}
+	return spec, nil
 }
 
 func (h *ProcHandle) List(ctx context.Context) ([]Info, error) {

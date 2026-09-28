@@ -1,8 +1,10 @@
 // Command vmctl 是本地虚拟机生命周期编排的命令行入口。
 //
 // 状态默认保存在 --state-dir（记录）与 --backend-dir（进程承载目录）。
-// 每个变更子命令在启动时都会先执行一次存储恢复 + 对账，
-// 因此即使宿主/进程异常重启，操作前也能看到确定的对账结论。
+// 每个子命令在启动时都会先执行一次 RestoreFromStore 重建内存配额台账，
+// 因此无论新起多少个进程、什么时候查询，占用都与持久化记录一致；
+// 变更/对账命令还会按需执行对账，把无法自动判定的偏差持久化为 ManualReview，
+// 由 resolve adopt/discard 人工收口。
 package main
 
 import (
@@ -34,6 +36,9 @@ type globalFlags struct {
 	capDisk    int64
 	image      string
 	json       bool
+	target     string
+	note       string
+	claim      bool
 }
 
 func main() {
@@ -57,7 +62,10 @@ func main() {
 	fs.Int64Var(&g.capMem, "capacity-mem", 4096, "host memory MB capacity")
 	fs.Int64Var(&g.capDisk, "capacity-disk", 16384, "host disk MB capacity")
 	fs.StringVar(&g.image, "image", "ubuntu-24.04", "instance image")
-	fs.BoolVar(&g.json, "json", false, "emit machine-readable JSON for list/quota/reconcile")
+	fs.BoolVar(&g.json, "json", false, "emit machine-readable JSON for list/quota/reconcile/reviews")
+	fs.StringVar(&g.target, "to", "Running", "resolve adopt target state: Defined|Running|Stopped")
+	fs.StringVar(&g.note, "note", "", "operator note recorded on manual resolution")
+	fs.BoolVar(&g.claim, "claim", false, "adopt an orphan whose spec is unreadable: register quota using --cpu/--mem/--disk")
 	_ = fs.Parse(args)
 	rest := fs.Args()
 
@@ -77,7 +85,7 @@ func main() {
 // 从而允许 `vmctl create web --cpu 1000` 这种标志在位置参数之后的写法
 // （标准库 flag 包遇到第一个位置参数即停止解析）。
 func reorderFlags(argv []string) []string {
-	boolFlags := map[string]bool{"json": true, "sim": true}
+	boolFlags := map[string]bool{"json": true, "sim": true, "claim": true}
 	flags := make([]string, 0, len(argv))
 	pos := make([]string, 0, len(argv))
 	for i := 0; i < len(argv); i++ {
@@ -113,6 +121,8 @@ func exitCodeFor(k domain.ErrorKind) int {
 		return 7
 	case domain.KindInconsistentState:
 		return 8
+	case domain.KindManualReviewPending:
+		return 9
 	default:
 		return 1
 	}
@@ -176,6 +186,10 @@ func run(ctx context.Context, cmd string, args []string, g *globalFlags) error {
 		if len(args) < 1 {
 			return errors.New("usage: vmctl get <id>")
 		}
+		// 新进程也必须先按持久化记录重建台账，保证"什么时候查、换哪个进程"占用都与事实一致。
+		if err := o.RestoreFromStore(ctx); err != nil {
+			return err
+		}
 		inst, err := o.Get(ctx, args[0])
 		if err != nil {
 			return err
@@ -184,6 +198,9 @@ func run(ctx context.Context, cmd string, args []string, g *globalFlags) error {
 		return nil
 
 	case "list":
+		if err := o.RestoreFromStore(ctx); err != nil {
+			return err
+		}
 		insts, err := o.List(ctx)
 		if err != nil {
 			return err
@@ -191,13 +208,80 @@ func run(ctx context.Context, cmd string, args []string, g *globalFlags) error {
 		if g.json {
 			return emitJSON(insts)
 		}
-		fmt.Printf("%-20s %-10s %-12s %s\n", "ID", "STATE", "BACKEND", "LAST_EVENT")
+		fmt.Printf("%-20s %-13s %-12s %s\n", "ID", "STATE", "BACKEND", "LAST_EVENT")
 		for _, in := range insts {
-			fmt.Printf("%-20s %-10s %-12s %s\n", in.ID, in.State, in.Backend, in.LastEvent)
+			fmt.Printf("%-20s %-13s %-12s %s\n", in.ID, in.State, in.Backend, in.LastEvent)
+			if in.State == domain.StateManualReview && in.Review != nil {
+				fmt.Printf("%-20s ** MANUAL REVIEW ** reason=%s actual=%s detail=%s\n",
+					"", in.Review.Reason, in.Review.ActualState, in.Review.Detail)
+			}
 		}
 		return nil
 
+	case "reviews":
+		if err := o.RestoreFromStore(ctx); err != nil {
+			return err
+		}
+		insts, err := o.ManualReviewList(ctx)
+		if err != nil {
+			return err
+		}
+		if g.json {
+			return emitJSON(insts)
+		}
+		if len(insts) == 0 {
+			fmt.Println("no instances pending manual review")
+			return nil
+		}
+		for _, in := range insts {
+			fmt.Printf("- %-16s reason=%-24s record=%-10s actual=%-8s raised=%s\n",
+				in.ID, in.Review.Reason, in.Review.RecordState, in.Review.ActualState,
+				in.Review.RaisedAt.Format("2006-01-02T15:04:05Z07:00"))
+			fmt.Printf("    %s\n", in.Review.Detail)
+		}
+		return nil
+
+	case "resolve":
+		// vmctl resolve <adopt|discard> <id> [--to Defined|Running|Stopped] [--note ...]
+		// 孤儿残留读不出规格时，adopt 还需 --cpu/--mem/--disk 补报。
+		if len(args) < 2 {
+			return errors.New("usage: vmctl resolve <adopt|discard> <id> [--to ...] [--note ...]")
+		}
+		if err := o.RestoreFromStore(ctx); err != nil {
+			return err
+		}
+		decision, id := args[0], args[1]
+		var target domain.State
+		switch domain.State(g.target) {
+		case domain.StateDefined, domain.StateRunning, domain.StateStopped:
+			target = domain.State(g.target)
+		default:
+			return fmt.Errorf("invalid --to %q (want Defined|Running|Stopped)", g.target)
+		}
+		var provided *domain.Spec
+		if g.claim {
+			s := domain.Spec{Image: g.image, Resources: domain.Resources{CPUMillis: g.cpu, MemoryMB: g.mem, DiskMB: g.disk}}
+			provided = &s
+		}
+		var inst *domain.Instance
+		switch orchestrator.ResolveDecision(decision) {
+		case orchestrator.ResolveAdopt:
+			inst, err = o.Resolve(ctx, id, orchestrator.ResolveAdopt, target, provided, g.note)
+		case orchestrator.ResolveDiscard:
+			inst, err = o.Resolve(ctx, id, orchestrator.ResolveDiscard, target, nil, g.note)
+		default:
+			return fmt.Errorf("unknown resolve decision %q (want adopt|discard)", decision)
+		}
+		if err != nil {
+			return err
+		}
+		printInstance(inst, g.json)
+		return nil
+
 	case "quota":
+		if err := o.RestoreFromStore(ctx); err != nil {
+			return err
+		}
 		snap := o.ResourceSnapshot()
 		if g.json {
 			return emitJSON(snap)
@@ -266,6 +350,12 @@ func printInstance(in *domain.Instance, asJSON bool) {
 		in.ID, in.State, in.Backend, in.Spec.Image,
 		in.Spec.Resources.CPUMillis, in.Spec.Resources.MemoryMB, in.Spec.Resources.DiskMB,
 		in.UpdatedAt.Format("2006-01-02T15:04:05Z07:00"), in.LastEvent)
+	if in.State == domain.StateManualReview && in.Review != nil {
+		fmt.Printf("  *** MANUAL REVIEW PENDING ***\n  reason=%s record=%s actual=%s specKnown=%t raised=%s\n  detail=%s\n",
+			in.Review.Reason, in.Review.RecordState, in.Review.ActualState,
+			in.Review.SpecKnown, in.Review.RaisedAt.Format("2006-01-02T15:04:05Z07:00"),
+			in.Review.Detail)
+	}
 }
 
 func emitJSON(v any) error {
@@ -284,6 +374,11 @@ commands:
   start <id>    Defined/Stopped -> Running (Running is idempotent)
   stop <id>     Running -> Stopped (Stopped is idempotent)
   destroy <id>  Defined/Stopped -> Destroyed (frees quota; tombstone kept)
+  resolve <adopt|discard> <id>
+                close a ManualReview instance: adopt to --to state (resource
+                stays reserved; use --claim with --cpu/--mem/--disk for orphans
+                whose spec.json is unreadable) or discard (undefine + free)
+  reviews       list instances pending manual review (with reason)
   get <id>      show one instance record
   list          list instance records
   quota         show host quota snapshot and per-instance reservations

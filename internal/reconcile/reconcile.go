@@ -6,10 +6,17 @@
 //	记录 Running        + 后端 stopped：guest 异常退出                -> 收敛为 Stopped
 //	记录 Defined/Stopped + 后端 absent： Undefine 已成功、Destroyed 未落盘 -> 收敛为 Destroyed 并释放配额
 //	记录 Destroyed      + 后端残留：   外部残留/半完成清理            -> 幂等 Undefine 后保持墓碑
-//	记录 Running        + 后端 absent：宿主疑似被重建，无法判定       -> 隔离
-//	后端独有对象（无记录）：归属无法判定                              -> 隔离为孤儿，绝不静默删除
+//	记录 Running        + 后端 absent：宿主疑似被重建，无法判定       -> 持久化挂起为 ManualReview
+//	后端独有对象（无记录）：归属无法判定                              -> 持久化创建 ManualReview 记录（孤儿）
 //
-// 所有"隔离"都在 Report.Quarantine 中显式列出并附带原因，绝不静默覆盖。
+// 后两类"待人工处理"不是只存在于本次对账报告里的易失结论：它们会随实例记录落盘，
+// 换新进程乃至宿主重启后，实例状态仍是 ManualReview 且带判定原因，常规变更一律拒绝，
+// 等待人工通过 orchestrator 的 ResolveAdopt（确认继续存在）/ResolveDiscard（确认清理）收口。
+//
+// 占用口径：台账权威集合为"状态持有资源"的记录（Defined/Running/Stopped/ManualReview）。
+// ManualReview 实例在收口前继续按规格占用，防止资源被再次分配；收口到具体正常状态后
+// 占用保持，收口到 Destroyed 后释放。唯一例外：无记录且后端读不出规格的孤儿，
+// 无法知道该占多少，台账无法计入（报告与日志显式标出），需人工收口时补报规格。
 package reconcile
 
 import (
@@ -46,10 +53,14 @@ type Verdict struct {
 // Report 是一次完整对账的结论。
 type Report struct {
 	Verdicts []Verdict
-	// Orphans 是后端存在但没有任何记录对应的承载残留。
+	// Orphans 是后端存在但没有任何记录对应的承载残留（首次发现时已落盘为 ManualReview）。
 	Orphans []string
-	// Quarantine 包含所有需人工处理的 id（含孤儿、矛盾记录、台账问题）。
+	// Quarantine 包含所有需人工处理的 id（含已持久化的 ManualReview、孤儿、台账问题）。
 	Quarantine []string
+	// ManualReviewIDs 是当前处于 ManualReview 冻结态的实例（结论已随记录持久化）。
+	ManualReviewIDs []string
+	// UnaccountedOrphans 是无记录且后端读不出规格、无法计入占用台账的孤儿 id。
+	UnaccountedOrphans []string
 	// QuotaConverged 表示配额台账已按权威集合重建。
 	QuotaConverged bool
 	QuotaDetail    string
@@ -89,9 +100,7 @@ func Run(
 
 	logf("[reconcile] START records=%d backendObjects=%d", len(records), len(actual))
 
-	recordIDs := make(map[string]struct{}, len(records))
 	for _, r := range records {
-		recordIDs[r.ID] = struct{}{}
 		v := Verdict{InstanceID: r.ID, RecordState: string(r.State), Before: string(r.State), After: string(r.State)}
 		info, found := actual[r.ID]
 		if !found {
@@ -99,38 +108,80 @@ func Run(
 		} else {
 			v.ActualState = string(info.Status)
 		}
-		v = decide(ctx, st, h, r, info, found, v, logf)
+		v = decide(ctx, st, h, r, info, found, v, rep, logf)
 		rep.Verdicts = append(rep.Verdicts, v)
 		if v.Outcome == OutcomeQuarantined {
 			rep.Quarantine = append(rep.Quarantine, r.ID)
 		}
+		if r.State == domain.StateManualReview {
+			rep.ManualReviewIDs = append(rep.ManualReviewIDs, r.ID)
+		}
 		delete(actual, r.ID)
 	}
 
-	// 后端独有对象：归属不明，隔离，绝不自动删除。
+	// 后端独有对象：归属不明。残留绝不删除，结论持久化为 ManualReview 记录，
+	// 使"待人工处理"跨进程/重启可见，并在规格可知时纳入占用台账防止超卖。
 	for id, info := range actual {
-		logf("[reconcile] ORPHAN id=%s actual=%s -> Quarantined (保留残留，等待人工裁决)", id, info.Status)
-		rep.Orphans = append(rep.Orphans, id)
-		rep.Quarantine = append(rep.Quarantine, id)
-		rep.Verdicts = append(rep.Verdicts, Verdict{
+		v := Verdict{
 			InstanceID:  id,
 			RecordState: "(none)",
 			ActualState: string(info.Status),
 			Outcome:     OutcomeQuarantined,
 			Before:      "(none)",
-			After:       "quarantined-orphan",
-			Action:      "none",
-			Detail:      "backend residue without any record: ownership ambiguous, residue preserved",
-		})
+		}
+		now := time.Now().UTC()
+		rv := &domain.Review{
+			Reason:      domain.ReviewOrphanBackend,
+			RecordState: "(none)",
+			ActualState: string(info.Status),
+			RaisedAt:    now,
+			SpecKnown:   info.HasSpec,
+			Detail:      "backend residue without any record: ownership ambiguous, residue preserved pending manual resolution",
+		}
+		inst := &domain.Instance{
+			ID:        id,
+			Name:      id,
+			Spec:      info.Spec,
+			State:     domain.StateManualReview,
+			Backend:   h.Name(),
+			CreatedAt: now,
+			UpdatedAt: now,
+			LastEvent: "quarantined: orphan backend residue",
+			Review:    rv,
+		}
+		if err := st.Put(ctx, inst); err != nil {
+			v.After = "quarantined-orphan-persist-failed"
+			v.Action = "none"
+			v.Detail = rv.Detail + " (persist failed: " + err.Error() + ")"
+			logf("[reconcile] ORPHAN id=%s persist FAILED: %v (残留保留，报告隔离)", id, err)
+		} else {
+			v.After = string(domain.StateManualReview)
+			v.Action = "persist-manual-review"
+			v.Detail = rv.Detail
+			records = append(records, inst)
+			rep.ManualReviewIDs = append(rep.ManualReviewIDs, id)
+			if !info.HasSpec {
+				rep.UnaccountedOrphans = append(rep.UnaccountedOrphans, id)
+				logf("[reconcile] ORPHAN id=%s actual=%s -> ManualReview（规格不可读，台账无法计入，收口时需补报规格）", id, info.Status)
+			} else {
+				logf("[reconcile] ORPHAN id=%s actual=%s -> ManualReview（已持久化，规格=%+v，占用继续计入）", id, info.Status, info.Spec.Resources)
+			}
+		}
+		rep.Orphans = append(rep.Orphans, id)
+		rep.Quarantine = append(rep.Quarantine, id)
+		rep.Verdicts = append(rep.Verdicts, v)
 	}
 
-	// 配额台账权威集合：未销毁且未被隔离的记录。
+	// 配额台账权威集合：所有"持有资源"状态的记录
+	// （Defined/Running/Stopped/ManualReview；Destroyed 墓碑除外）。
+	// ManualReview 继续占用，收口裁决前资源不能被再次分配。
+	// 规格不可读的孤儿无法计入，已在 UnaccountedOrphans 显式标出。
 	alive := make(map[string]domain.Resources)
 	for _, r := range records {
-		if r.State == domain.StateDestroyed {
+		if !r.State.HoldsResources() {
 			continue
 		}
-		if rep.isQuarantined(r.ID) {
+		if r.State == domain.StateManualReview && (r.Review == nil || !r.Review.SpecKnown) {
 			continue
 		}
 		alive[r.ID] = r.Spec.Resources
@@ -144,13 +195,13 @@ func Run(
 		} else {
 			rep.QuotaConverged = true
 			rep.QuotaDetail = detail
-			logf("[reconcile] quota ledger CONVERGED alive=%d snapshot=%s", len(alive), detail)
+			logf("[reconcile] quota ledger CONVERGED held=%d snapshot=%s", len(alive), detail)
 		}
 	}
 
-	logf("[reconcile] DONE matched=%d recovered=%d quarantined=%d orphans=%d quotaConverged=%t",
+	logf("[reconcile] DONE matched=%d recovered=%d quarantined=%d orphans=%d manualReview=%d quotaConverged=%t",
 		rep.count(OutcomeMatched), rep.count(OutcomeRecovered), rep.count(OutcomeQuarantined),
-		len(rep.Orphans), rep.QuotaConverged)
+		len(rep.Orphans), len(rep.ManualReviewIDs), rep.QuotaConverged)
 	return rep, nil
 }
 
@@ -163,9 +214,27 @@ func decide(
 	info backend.Info,
 	found bool,
 	v Verdict,
+	rep *Report,
 	logf Logf,
 ) Verdict {
 	switch r.State {
+	case domain.StateManualReview:
+		// 已持久化的待人工处理：重复对账绝不覆盖、绝不自动动作，只回报当前事实。
+		v.Outcome = OutcomeQuarantined
+		v.After = string(domain.StateManualReview)
+		v.Action = "held-pending-manual-resolution"
+		if r.Review != nil {
+			v.Detail = "held for manual review since " + r.Review.RaisedAt.Format(time.RFC3339) +
+				" reason=" + string(r.Review.Reason) + ": " + r.Review.Detail
+		} else {
+			v.Detail = "held for manual review (no review detail)"
+		}
+		if r.Review != nil && !r.Review.SpecKnown {
+			rep.UnaccountedOrphans = append(rep.UnaccountedOrphans, r.ID)
+		}
+		logf("[reconcile] id=%s HELD ManualReview actual=%s（不覆盖、不动作，等待人工收口）", r.ID, v.ActualState)
+		return v
+
 	case domain.StateDefined, domain.StateStopped:
 		if !found {
 			// 唯一内部可达路径：Destroy 的 Undefine 已成功而 Destroyed 未落盘。
@@ -193,8 +262,12 @@ func decide(
 
 	case domain.StateRunning:
 		if !found {
-			return quarantine(v, "quarantined-running-missing-backend",
-				"record Running but backend fully absent: host rebuild or external wipe, cannot auto-recreate")
+			// 宿主疑似被重建/外部清理：记录说在跑但承载整体消失，无法判定该重建还是认销毁。
+			// 结论持久化为 ManualReview：不自动重建、不删任何残留（本就没有），占用继续保留。
+			return holdForReview(ctx, st, r, "absent",
+				domain.ReviewRunningMissingBackend,
+				"record Running but backend fully absent: host rebuild or external wipe, cannot auto-recreate",
+				v, logf)
 		}
 		switch info.Status {
 		case backend.StatusRunning:
@@ -229,6 +302,48 @@ func decide(
 	}
 	logf("[reconcile] id=%s record=%s actual=%s -> %s (%s)",
 		v.InstanceID, v.RecordState, v.ActualState, v.Outcome, v.Detail)
+	return v
+}
+
+// holdForReview 把一条无法自动判定的记录持久化落定为 ManualReview 冻结态，
+// 并在记录上保留判定原因与现场（跨进程/重启可见）。不触碰任何后端承载。
+func holdForReview(
+	ctx context.Context,
+	st store.Store,
+	r *domain.Instance,
+	actualState string,
+	reason domain.ReviewReason,
+	detail string,
+	v Verdict,
+	logf Logf,
+) Verdict {
+	now := time.Now().UTC()
+	from := r.State
+	r.Review = &domain.Review{
+		Reason:      reason,
+		Detail:      detail,
+		RecordState: string(from),
+		ActualState: actualState,
+		RaisedAt:    now,
+		SpecKnown:   true,
+	}
+	r.State = domain.StateManualReview
+	r.UpdatedAt = now
+	r.LastEvent = "quarantined: " + detail
+	if err := st.Put(ctx, r); err != nil {
+		v.Outcome = OutcomeQuarantined
+		v.After = "quarantined-persist-failed"
+		v.Action = "none"
+		v.Detail = detail + " (persist failed: " + err.Error() + ")"
+		logf("[reconcile] id=%s MANUAL-REVIEW PERSIST FAILED from=%s: %v", r.ID, from, err)
+		return v
+	}
+	v.Outcome = OutcomeQuarantined
+	v.After = string(domain.StateManualReview)
+	v.Action = "persist-manual-review"
+	v.Detail = detail
+	logf("[reconcile] id=%s action=persist-manual-review %s -> ManualReview reason=%s（占用继续计入，等待人工收口）",
+		r.ID, from, reason)
 	return v
 }
 
@@ -277,13 +392,4 @@ func (r *Report) count(o Outcome) int {
 		}
 	}
 	return n
-}
-
-func (r *Report) isQuarantined(id string) bool {
-	for _, q := range r.Quarantine {
-		if q == id {
-			return true
-		}
-	}
-	return false
 }

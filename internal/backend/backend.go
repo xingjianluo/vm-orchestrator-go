@@ -21,6 +21,10 @@ type Info struct {
 	Status Status
 	Pid    int
 	Detail string
+	// Spec 是承载对象的规格；HasSpec=false 表示后端无法读出规格
+	// （例如残留目录中缺少 spec.json），仅可能出现在归属不明的孤儿上。
+	Spec    domain.Spec
+	HasSpec bool
 }
 
 // Handle 抽象本地承载能力（模拟虚拟化或进程级实例）。
