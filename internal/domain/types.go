@@ -14,6 +14,14 @@ const (
 	StateStopped State = "Stopped"
 	// StateDestroyed 终态：后端已清除、配额已释放，仅保留墓碑记录。
 	StateDestroyed State = "Destroyed"
+	// StatePendingManual 待人工处理：重启对账发现记录与承载事实无法唯一判定，
+	// 系统把结论（原因/规则/当时事实）持久化挂起。该状态下：
+	//   - 一切常规生命周期动作（create/start/stop/destroy）一律拒绝，
+	//     错误类别为 pending_manual，与其他原因可程序化区分；
+	//   - 对账不会再自动收敛或覆盖它，也不会清理其后端承载残留；
+	//   - 只有显式人工收口 Resolve（keep/destroy）才能离开该状态；
+	//   - 配额口径：挂起期间继续按规格计入占用（冻结保留），收口销毁时才释放。
+	StatePendingManual State = "PendingManual"
 )
 
 // Resources 描述一份资源量（CPU 用毫核表示，内存与磁盘用 MB）。
@@ -59,6 +67,21 @@ type Spec struct {
 	Image     string    `json:"image"`
 }
 
+// PendingInfo 记录"待人工处理"的持久化结论。
+// 只要 Instance.Pending 非 nil，该实例即处于挂起等待人工收口状态。
+type PendingInfo struct {
+	// Reason 是人类可读的判定原因（必须随记录持久化并在查询时带回）。
+	Reason string `json:"reason"`
+	// Rule 是触发挂起的确定性判定规则码（如 running-missing-backend）。
+	Rule string `json:"rule"`
+	// RecordState 是挂起那一刻记录上的状态（审计用，便于人工判断）。
+	RecordState string `json:"record_state"`
+	// ActualState 是挂起那一刻观测到的后端承载事实（absent/stopped/running）。
+	ActualState string `json:"actual_state"`
+	// DetectedAt 是判定时间。
+	DetectedAt time.Time `json:"detected_at"`
+}
+
 // Instance 是持久化的实例记录。
 type Instance struct {
 	ID        string    `json:"id"`
@@ -69,6 +92,9 @@ type Instance struct {
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 	LastEvent string    `json:"last_event"`
+	// Pending 非 nil 表示该实例处于待人工处理状态（State 也必为 PendingManual）。
+	// 收口（Resolve）完成后必须清空，使记录回到正常状态机或终态。
+	Pending *PendingInfo `json:"pending,omitempty"`
 }
 
 // Clone 返回深拷贝，避免调用方在锁外修改内部记录。
@@ -77,13 +103,22 @@ func (i *Instance) Clone() *Instance {
 		return nil
 	}
 	cp := *i
+	if i.Pending != nil {
+		p := *i.Pending
+		cp.Pending = &p
+	}
 	return &cp
+}
+
+// IsPending 报告实例是否处于待人工处理状态。
+func (i *Instance) IsPending() bool {
+	return i != nil && i.State == StatePendingManual && i.Pending != nil
 }
 
 // Valid 判断状态值是否合法。
 func (s State) Valid() bool {
 	switch s {
-	case StateDefined, StateRunning, StateStopped, StateDestroyed:
+	case StateDefined, StateRunning, StateStopped, StateDestroyed, StatePendingManual:
 		return true
 	default:
 		return false

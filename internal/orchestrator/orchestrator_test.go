@@ -28,7 +28,10 @@ func newHarness(t *testing.T, capacity domain.Resources) (*orchestrator.Orchestr
 		t.Fatal(err)
 	}
 	h := backend.NewSimHandle(backend.FaultHooks{})
-	o := orchestrator.New(st, h, capacity, testLog{t}.Logf)
+	o, err := orchestrator.New(st, h, capacity, testLog{t}.Logf)
+	if err != nil {
+		t.Fatal(err)
+	}
 	return o, h
 }
 
@@ -236,9 +239,12 @@ func TestBackendFailureRollsBackQuota(t *testing.T) {
 			return nil
 		},
 	})
-	o := orchestrator.New(st, h, domain.Resources{CPUMillis: 4000, MemoryMB: 2048, DiskMB: 8192}, testLog{t}.Logf)
+	o, err := orchestrator.New(st, h, domain.Resources{CPUMillis: 4000, MemoryMB: 2048, DiskMB: 8192}, testLog{t}.Logf)
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	_, err := o.Create(ctx, "failme", "failme", smallSpec(1000, 512, 1024))
+	_, err = o.Create(ctx, "failme", "failme", smallSpec(1000, 512, 1024))
 	if !domain.IsKind(err, domain.KindBackendFailure) {
 		t.Fatalf("want backend_failure, got %v", err)
 	}

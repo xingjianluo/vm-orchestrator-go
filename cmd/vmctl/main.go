@@ -34,6 +34,10 @@ type globalFlags struct {
 	capDisk    int64
 	image      string
 	json       bool
+	resKeep    bool
+	resDestroy bool
+	target     string
+	note       string
 }
 
 func main() {
@@ -58,6 +62,12 @@ func main() {
 	fs.Int64Var(&g.capDisk, "capacity-disk", 16384, "host disk MB capacity")
 	fs.StringVar(&g.image, "image", "ubuntu-24.04", "instance image")
 	fs.BoolVar(&g.json, "json", false, "emit machine-readable JSON for list/quota/reconcile")
+	if cmd == "resolve" {
+		fs.BoolVar(&g.resKeep, "keep", false, "manual resolution: confirm the instance should exist")
+		fs.BoolVar(&g.resDestroy, "destroy", false, "manual resolution: confirm the instance should be cleaned up")
+		fs.StringVar(&g.target, "target", "Running", "with --keep: target state Running/Stopped/Defined")
+		fs.StringVar(&g.note, "note", "", "optional auditor note recorded in last_event")
+	}
 	_ = fs.Parse(args)
 	rest := fs.Args()
 
@@ -77,7 +87,7 @@ func main() {
 // 从而允许 `vmctl create web --cpu 1000` 这种标志在位置参数之后的写法
 // （标准库 flag 包遇到第一个位置参数即停止解析）。
 func reorderFlags(argv []string) []string {
-	boolFlags := map[string]bool{"json": true, "sim": true}
+	boolFlags := map[string]bool{"json": true, "sim": true, "keep": true, "destroy": true}
 	flags := make([]string, 0, len(argv))
 	pos := make([]string, 0, len(argv))
 	for i := 0; i < len(argv); i++ {
@@ -113,6 +123,8 @@ func exitCodeFor(k domain.ErrorKind) int {
 		return 7
 	case domain.KindInconsistentState:
 		return 8
+	case domain.KindPendingManual:
+		return 9
 	default:
 		return 1
 	}
@@ -127,8 +139,11 @@ func run(ctx context.Context, cmd string, args []string, g *globalFlags) error {
 	if err != nil {
 		return err
 	}
-	o := orchestrator.New(st, h, domain.Resources{CPUMillis: g.capCPU, MemoryMB: g.capMem, DiskMB: g.capDisk},
+	o, err := orchestrator.New(st, h, domain.Resources{CPUMillis: g.capCPU, MemoryMB: g.capMem, DiskMB: g.capDisk},
 		log.Printf)
+	if err != nil {
+		return err
+	}
 
 	switch cmd {
 	case "create":
@@ -191,9 +206,13 @@ func run(ctx context.Context, cmd string, args []string, g *globalFlags) error {
 		if g.json {
 			return emitJSON(insts)
 		}
-		fmt.Printf("%-20s %-10s %-12s %s\n", "ID", "STATE", "BACKEND", "LAST_EVENT")
+		fmt.Printf("%-20s %-14s %-12s %s\n", "ID", "STATE", "BACKEND", "LAST_EVENT")
 		for _, in := range insts {
-			fmt.Printf("%-20s %-10s %-12s %s\n", in.ID, in.State, in.Backend, in.LastEvent)
+			fmt.Printf("%-20s %-14s %-12s %s\n", in.ID, in.State, in.Backend, in.LastEvent)
+			if in.IsPending() {
+				fmt.Printf("%-20s pending-reason: [%s] %s (record_was=%s actual=%s)\n",
+					"", in.Pending.Rule, in.Pending.Reason, in.Pending.RecordState, in.Pending.ActualState)
+			}
 		}
 		return nil
 
@@ -231,6 +250,38 @@ func run(ctx context.Context, cmd string, args []string, g *globalFlags) error {
 			rep.Orphans, rep.Quarantine, rep.QuotaConverged, rep.QuotaDetail)
 		return nil
 
+	case "resolve":
+		if len(args) < 1 {
+			return errors.New("usage: vmctl resolve <id> --keep [--target Running|Stopped|Defined] | --destroy [--note ...]")
+		}
+		if g.resKeep == g.resDestroy {
+			return domain.NewInvalidArgumentError("resolve",
+				"exactly one of --keep or --destroy must be given")
+		}
+		req := orchestrator.ResolveRequest{ID: args[0], Note: g.note}
+		if g.resKeep {
+			req.Decision = orchestrator.ResolveKeep
+			switch strings.ToLower(g.target) {
+			case "running":
+				req.Target = domain.StateRunning
+			case "stopped":
+				req.Target = domain.StateStopped
+			case "defined":
+				req.Target = domain.StateDefined
+			default:
+				return domain.NewInvalidArgumentError("resolve",
+					"--target must be Running/Stopped/Defined, got "+g.target)
+			}
+		} else {
+			req.Decision = orchestrator.ResolveDestroy
+		}
+		inst, err := o.Resolve(ctx, req)
+		if err != nil {
+			return err
+		}
+		printInstance(inst, g.json)
+		return nil
+
 	default:
 		usage()
 		return fmt.Errorf("unknown command %q", cmd)
@@ -266,6 +317,10 @@ func printInstance(in *domain.Instance, asJSON bool) {
 		in.ID, in.State, in.Backend, in.Spec.Image,
 		in.Spec.Resources.CPUMillis, in.Spec.Resources.MemoryMB, in.Spec.Resources.DiskMB,
 		in.UpdatedAt.Format("2006-01-02T15:04:05Z07:00"), in.LastEvent)
+	if in.IsPending() {
+		fmt.Printf("  PENDING MANUAL: rule=%s record_was=%s actual=%s\n    reason=%s\n",
+			in.Pending.Rule, in.Pending.RecordState, in.Pending.ActualState, in.Pending.Reason)
+	}
 }
 
 func emitJSON(v any) error {
@@ -288,6 +343,9 @@ commands:
   list          list instance records
   quota         show host quota snapshot and per-instance reservations
   reconcile     run restart reconciliation and print verdicts
+  resolve <id>  manual resolution of a PendingManual instance:
+                  --keep --target Running|Stopped|Defined [--note ...]
+                  --destroy [--note ...]
 
 flags (common):
   --state-dir, --backend-dir, --sim

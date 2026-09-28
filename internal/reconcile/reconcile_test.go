@@ -50,7 +50,10 @@ func newEnv(t *testing.T, cap domain.Resources) *env {
 		t.Fatal(err)
 	}
 	h := backend.NewSimHandle(backend.FaultHooks{})
-	o := orchestrator.New(st, h, cap, testLogger(t))
+	o, err := orchestrator.New(st, h, cap, testLogger(t))
+	if err != nil {
+		t.Fatal(err)
+	}
 	return &env{st: st, h: h, o: o}
 }
 
@@ -189,7 +192,10 @@ func TestReconcileHalfDoneDestroy(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 重建一个"重启后"的新编排器：先恢复台账（记录仍是 Defined）。
-	o2 := orchestrator.New(e.st, e.h, cap, testLogger(t))
+	o2, err := orchestrator.New(e.st, e.h, cap, testLogger(t))
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := o2.RestoreFromStore(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -218,7 +224,7 @@ func TestReconcileHalfDoneDestroy(t *testing.T) {
 	}
 }
 
-// TestReconcileRunningMissingBackend Running 记录但后端整体消失 -> 隔离，不自动重建。
+// TestReconcileRunningMissingBackend Running 记录但后端整体消失 -> 持久化挂起，不自动重建。
 func TestReconcileRunningMissingBackend(t *testing.T) {
 	ctx := context.Background()
 	e := newEnv(t, domain.Resources{CPUMillis: 8000, MemoryMB: 4096, DiskMB: 16384})
@@ -233,20 +239,36 @@ func TestReconcileRunningMissingBackend(t *testing.T) {
 	if err := e.h.Undefine(ctx, "lost"); err != nil {
 		t.Fatal(err)
 	}
-	// 重新写回 Running 记录（Undefine 本身不动记录，这里记录本就还是 Running）。
 
 	rep := e.reconcile(t)
 	v := findVerdict(rep, "lost")
 	if v.Outcome != reconcile.OutcomeQuarantined {
-		t.Fatalf("ambiguous loss must quarantine, got %s (%s)", v.Outcome, v.Detail)
+		t.Fatalf("ambiguous loss must be quarantined, got %s (%s)", v.Outcome, v.Detail)
 	}
+	// 结论必须持久化为 PendingManual 并携带原因，而不是只留在内存 Report 里。
 	got, _ := e.st.Get(ctx, "lost")
-	if got.State != domain.StateRunning {
-		t.Fatalf("quarantine must NOT overwrite record, got %s", got.State)
+	if got.State != domain.StatePendingManual {
+		t.Fatalf("ambiguous loss must persist as PendingManual, got %s", got.State)
 	}
-	// 被隔离实例不纳入台账重建 -> 其配额被显式摘出等待裁决，避免漂移。
-	if _, ok := e.o.ResourceSnapshot().Reservations["lost"]; ok {
-		t.Fatal("quarantined instance must be excluded from rebuilt ledger until resolved")
+	if got.Pending == nil || got.Pending.Rule != "running-missing-backend" {
+		t.Fatalf("pending reason/rule must be persisted: %+v", got.Pending)
+	}
+	if got.Pending.RecordState != "Running" || got.Pending.ActualState != "absent" {
+		t.Fatalf("pending must record prior state and observed fact: %+v", got.Pending)
+	}
+	// 后端残留（此处已 absent）对账不会擅自重建；再来一轮对账仍然维持挂起。
+	rep2 := e.reconcile(t)
+	if v2 := findVerdict(rep2, "lost"); v2.Outcome != reconcile.OutcomeQuarantined {
+		t.Fatalf("repeat reconcile must keep pending, got %s", v2.Outcome)
+	}
+	got2, _ := e.st.Get(ctx, "lost")
+	if got2.State != domain.StatePendingManual {
+		t.Fatalf("repeat reconcile must not overwrite pending state, got %s", got2.State)
+	}
+	// 占用口径：挂起实例继续按规格冻结计入台账（等待人工裁决，避免超额重发）。
+	r2, ok := e.o.ResourceSnapshot().Reservations["lost"]
+	if !ok || r2 != spec.Resources {
+		t.Fatalf("pending instance must keep frozen reservation: ok=%v r=%+v", ok, r2)
 	}
 }
 
@@ -368,15 +390,20 @@ func TestReconcileMixedDeterministic(t *testing.T) {
 			t.Errorf("id=%s outcome=%s want %s", id, got, want)
 		}
 	}
-	// 配额守恒：defined1 + crash1 + startwin1 = 3 台存活；
-	// halfkill1 收敛 Destroyed（释放）；ambiguous1 隔离（摘出）；orphan1 无记录不占配额。
+	// 配额守恒：defined1 + crash1 + startwin1 + ambiguous1(挂起仍冻结计入) = 4 份；
+	// halfkill1 收敛 Destroyed（释放）；orphan1 无记录不占配额。
 	snap := e.o.ResourceSnapshot()
-	wantUsed := domain.Resources{CPUMillis: 3000, MemoryMB: 1536, DiskMB: 3072}
+	wantUsed := domain.Resources{CPUMillis: 4000, MemoryMB: 2048, DiskMB: 4096}
 	if snap.Used != wantUsed {
 		t.Fatalf("ledger after mixed reconcile wrong: got %+v want %+v", snap.Used, wantUsed)
 	}
-	if len(snap.Reservations) != 3 {
+	if len(snap.Reservations) != 4 {
 		t.Fatalf("reservations = %v", snap.Reservations)
 	}
-	t.Logf("[snapshot] mixed reconcile settled: used=%+v reservations=%d", snap.Used, len(snap.Reservations))
+	// ambiguous1 已持久化为 PendingManual 且带原因。
+	if am, _ := e.st.Get(ctx, "ambiguous1"); am.State != domain.StatePendingManual || am.Pending == nil {
+		t.Fatalf("ambiguous1 must persist pending with reason: %+v", am)
+	}
+	t.Logf("[snapshot] mixed reconcile settled: used=%+v reservations=%d (pending frozen)",
+		snap.Used, len(snap.Reservations))
 }

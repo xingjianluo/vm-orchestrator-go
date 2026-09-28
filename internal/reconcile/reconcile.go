@@ -6,10 +6,18 @@
 //	记录 Running        + 后端 stopped：guest 异常退出                -> 收敛为 Stopped
 //	记录 Defined/Stopped + 后端 absent： Undefine 已成功、Destroyed 未落盘 -> 收敛为 Destroyed 并释放配额
 //	记录 Destroyed      + 后端残留：   外部残留/半完成清理            -> 幂等 Undefine 后保持墓碑
-//	记录 Running        + 后端 absent：宿主疑似被重建，无法判定       -> 隔离
+//	记录 Running        + 后端 absent：宿主疑似被重建，无法判定       -> 持久化挂起 PendingManual
+//	记录是 PendingManual：仍在等待人工收口                            -> 维持挂起，不判定、不改动
 //	后端独有对象（无记录）：归属无法判定                              -> 隔离为孤儿，绝不静默删除
 //
-// 所有"隔离"都在 Report.Quarantine 中显式列出并附带原因，绝不静默覆盖。
+// 对"有记录但无法自动判定"的实例，对账会把结论持久化为 PendingManual 状态
+// （携带规则码、原因、挂起时的记录状态与后端事实）。挂起实例：
+//   - 不被后续对账自动覆盖、其后端承载残留不被清理；
+//   - 常规生命周期动作由编排层以 pending_manual 拒绝；
+//   - 配额按规格冻结保留并计入台账（详见 README 占用口径），直到人工收口。
+//
+// 无记录的后端孤儿对象无法生成实例记录（规格未知、归属不明），只列入
+// Report.Orphans/Quarantine 且不计入占用，等待人工另行裁决。
 package reconcile
 
 import (
@@ -124,13 +132,18 @@ func Run(
 		})
 	}
 
-	// 配额台账权威集合：未销毁且未被隔离的记录。
+	// 配额台账权威集合：所有非 Destroyed 记录。
+	// 挂起（PendingManual）实例继续按规格冻结计入占用——它的归属尚未裁决，
+	// 其承载残留仍在、规格仍然有效；若把它摘出台账，等于在没有释放任何真实
+	// 资源的情况下把容量重新发出去，会造成超额分配与跨进程读数不一致。
+	// 无记录孤儿因规格未知、归属不明，无法计入（见包注释）。
+	finalRecords, err := st.List(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("reconcile: reload records for ledger: %w", err)
+	}
 	alive := make(map[string]domain.Resources)
-	for _, r := range records {
+	for _, r := range finalRecords {
 		if r.State == domain.StateDestroyed {
-			continue
-		}
-		if rep.isQuarantined(r.ID) {
 			continue
 		}
 		alive[r.ID] = r.Spec.Resources
@@ -166,6 +179,17 @@ func decide(
 	logf Logf,
 ) Verdict {
 	switch r.State {
+	case domain.StatePendingManual:
+		// 已在等待人工收口：不再做任何自动判定，不改记录、不碰后端残留。
+		detail := "already pending manual resolution"
+		if r.Pending != nil {
+			detail = "already pending manual resolution: rule=" + r.Pending.Rule + " reason=" + r.Pending.Reason
+		}
+		v.Outcome = OutcomeQuarantined
+		v.After = "pending-manual (awaiting human resolution)"
+		v.Action = "none"
+		v.Detail = detail
+
 	case domain.StateDefined, domain.StateStopped:
 		if !found {
 			// 唯一内部可达路径：Destroy 的 Undefine 已成功而 Destroyed 未落盘。
@@ -188,13 +212,15 @@ func decide(
 				"guest running while record not Running: Start-side-effect committed before crash, adopted as Running",
 				v, logf)
 		default:
-			return quarantine(v, "quarantined-unknown-actual", "unknown backend status: "+string(info.Status))
+			return markPending(ctx, st, r, "unknown-actual",
+				"unknown backend status: "+string(info.Status), v, logf)
 		}
 
 	case domain.StateRunning:
 		if !found {
-			return quarantine(v, "quarantined-running-missing-backend",
-				"record Running but backend fully absent: host rebuild or external wipe, cannot auto-recreate")
+			return markPending(ctx, st, r, "running-missing-backend",
+				"record Running but backend fully absent: host rebuild or external wipe, cannot auto-recreate",
+				v, logf)
 		}
 		switch info.Status {
 		case backend.StatusRunning:
@@ -204,7 +230,8 @@ func decide(
 			return persist(ctx, st, r, domain.StateStopped, "converge-crash",
 				"guest exited while record said Running (crash/unclean kill); converged to Stopped", v, logf)
 		default:
-			return quarantine(v, "quarantined-unknown-actual", "unknown backend status: "+string(info.Status))
+			return markPending(ctx, st, r, "unknown-actual",
+				"unknown backend status: "+string(info.Status), v, logf)
 		}
 
 	case domain.StateDestroyed:
@@ -266,6 +293,50 @@ func quarantine(v Verdict, after, detail string) Verdict {
 	v.After = after
 	v.Action = "none"
 	v.Detail = detail
+	return v
+}
+
+// markPending 把无法自动判定的有记录实例持久化为 PendingManual。
+// 记录的原状态保存在 Pending.RecordState 中（不丢弃），后端承载事实不动，
+// 以便换新进程/重启后结论仍然可见，且人工可据此收口。
+func markPending(
+	ctx context.Context,
+	st store.Store,
+	r *domain.Instance,
+	rule, detail string,
+	v Verdict,
+	logf Logf,
+) Verdict {
+	from := r.State
+	actual := v.ActualState
+	if actual == "" {
+		actual = "unknown"
+	}
+	r.State = domain.StatePendingManual
+	r.UpdatedAt = time.Now().UTC()
+	r.Pending = &domain.PendingInfo{
+		Reason:      detail,
+		Rule:        rule,
+		RecordState: string(from),
+		ActualState: actual,
+		DetectedAt:  r.UpdatedAt,
+	}
+	r.LastEvent = "pending-manual: " + detail
+	if err := st.Put(ctx, r); err != nil {
+		// 落盘失败：内存中仍按隔离上报，记录保持原样，等下一次对账重试。
+		v.Outcome = OutcomeQuarantined
+		v.After = "pending-persist-failed"
+		v.Action = "none"
+		v.Detail = detail + " (pending persist failed: " + err.Error() + ")"
+		logf("[reconcile] id=%s PENDING PERSIST FAILED from=%s: %v", r.ID, from, err)
+		return v
+	}
+	v.Outcome = OutcomeQuarantined
+	v.After = string(domain.StatePendingManual)
+	v.Action = "pending-manual"
+	v.Detail = detail
+	logf("[reconcile] id=%s action=pending-manual PERSIST %s -> PendingManual rule=%s actual=%s",
+		r.ID, from, rule, actual)
 	return v
 }
 

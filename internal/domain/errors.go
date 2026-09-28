@@ -16,6 +16,9 @@ const (
 	KindBackendFailure       ErrorKind = "backend_failure"
 	KindInconsistentState    ErrorKind = "inconsistent_state"
 	KindInvalidArgument      ErrorKind = "invalid_argument"
+	// KindPendingManual 实例处于待人工处理状态：常规生命周期动作一律拒绝，
+	// 只能通过显式人工收口（Resolve keep/destroy）推进。
+	KindPendingManual ErrorKind = "pending_manual"
 )
 
 // OpError 携带可区分的错误类别与上下文。
@@ -101,4 +104,9 @@ func NewInvalidArgumentError(op, reason string) error {
 
 func NewInconsistentStateError(op, id, reason string) error {
 	return &OpError{Kind: KindInconsistentState, Op: op, InstanceID: id, Reason: reason}
+}
+
+// NewPendingManualError 构造"实例待人工处理"拒绝错误；reason 携带挂起原因与规则码。
+func NewPendingManualError(op, id, reason string) error {
+	return &OpError{Kind: KindPendingManual, Op: op, InstanceID: id, Reason: reason}
 }
