@@ -17,6 +17,10 @@
 // ManualReview 实例在收口前继续按规格占用，防止资源被再次分配；收口到具体正常状态后
 // 占用保持，收口到 Destroyed 后释放。唯一例外：无记录且后端读不出规格的孤儿，
 // 无法知道该占多少，台账无法计入（报告与日志显式标出），需人工收口时补报规格。
+//
+// 重建占用超过当前容量（如超大孤儿残留）不是错误：台账仍按权威集合如实重建并标记
+// CapacityExceeded，记录/占用保持自洽，查询与人工收口一律可用；它只阻止"新增占用"
+// 的准入（host_overcommitted），直到人工 adopt/discard 把占用消化回容量以内。
 package reconcile
 
 import (
@@ -26,6 +30,7 @@ import (
 
 	"github.com/xingjianluo/vm-orchestrator-go/internal/backend"
 	"github.com/xingjianluo/vm-orchestrator-go/internal/domain"
+	"github.com/xingjianluo/vm-orchestrator-go/internal/quota"
 	"github.com/xingjianluo/vm-orchestrator-go/internal/store"
 )
 
@@ -61,13 +66,22 @@ type Report struct {
 	ManualReviewIDs []string
 	// UnaccountedOrphans 是无记录且后端读不出规格、无法计入占用台账的孤儿 id。
 	UnaccountedOrphans []string
-	// QuotaConverged 表示配额台账已按权威集合重建。
+	// QuotaConverged 表示配额台账已按权威集合重建（记录集合与台账一致）。
+	// 注意：即使重建占用超过容量，台账同样算"已收敛"——超容量由
+	// CapacityExceeded 单独暴露为结论/告警，不再算作隔离项。
 	QuotaConverged bool
-	QuotaDetail    string
+	// CapacityExceeded 表示重建后的占用总额在至少一个维度上超过当前宿主容量。
+	// 这是一种需要人工知晓的对账结论（通常意味着有超大残留待收口），但它不
+	// 阻断任何查询或收口命令；ExceededDimensions 给出超出维度。
+	CapacityExceeded   bool
+	ExceededDimensions []string
+	QuotaDetail        string
 }
 
-// LedgerRebuilder 以"仍存活实例的配额集合"重建配额台账，返回人类可读的快照描述。
-type LedgerRebuilder func(alive map[string]domain.Resources) (string, error)
+// LedgerRebuilder 以"仍存活实例的配额集合"重建配额台账，返回重建后的台账快照与
+// 人类可读描述。台账按权威集合如实重建；即使占用超过容量也返回成功，由快照上的
+// OverCommit 标记表达该结论（只有权威集合本身非法时才返回 error）。
+type LedgerRebuilder func(alive map[string]domain.Resources) (quota.Snapshot, string, error)
 
 // Logf 输出对账过程中的操作序列与结论。
 type Logf func(format string, args ...any)
@@ -187,21 +201,33 @@ func Run(
 		alive[r.ID] = r.Spec.Resources
 	}
 	if rebuildLedger != nil {
-		detail, err := rebuildLedger(alive)
+		snap, detail, err := rebuildLedger(alive)
 		if err != nil {
+			// 只有权威集合本身非法（如非正规格）才会到这里。
 			rep.QuotaDetail = "ledger rebuild rejected: " + err.Error()
-			logf("[reconcile] QUOTA DRIFT: %s", rep.QuotaDetail)
+			logf("[reconcile] QUOTA LEDGER ERROR: %s", rep.QuotaDetail)
 			rep.Quarantine = append(rep.Quarantine, "(quota-ledger)")
 		} else {
 			rep.QuotaConverged = true
 			rep.QuotaDetail = detail
-			logf("[reconcile] quota ledger CONVERGED held=%d snapshot=%s", len(alive), detail)
+			if snap.OverCommit {
+				// 超容量只是对账结论/告警：台账已如实落地且自洽，
+				// 查询与人工收口不受阻；新增准入会被 host_overcommitted 拒绝。
+				rep.CapacityExceeded = true
+				rep.ExceededDimensions = snap.Exceeded
+				logf("[reconcile] CAPACITY EXCEEDED dimensions=%v used={cpu:%d,mem:%d,disk:%d} capacity={cpu:%d,mem:%d,disk:%d}（待人工收口消化；查询/resolve 不受影响）",
+					snap.Exceeded,
+					snap.Used.CPUMillis, snap.Used.MemoryMB, snap.Used.DiskMB,
+					snap.Capacity.CPUMillis, snap.Capacity.MemoryMB, snap.Capacity.DiskMB)
+			}
+			logf("[reconcile] quota ledger CONVERGED held=%d overCommit=%t snapshot=%s",
+				len(alive), snap.OverCommit, detail)
 		}
 	}
 
-	logf("[reconcile] DONE matched=%d recovered=%d quarantined=%d orphans=%d manualReview=%d quotaConverged=%t",
+	logf("[reconcile] DONE matched=%d recovered=%d quarantined=%d orphans=%d manualReview=%d quotaConverged=%t capacityExceeded=%t",
 		rep.count(OutcomeMatched), rep.count(OutcomeRecovered), rep.count(OutcomeQuarantined),
-		len(rep.Orphans), len(rep.ManualReviewIDs), rep.QuotaConverged)
+		len(rep.Orphans), len(rep.ManualReviewIDs), rep.QuotaConverged, rep.CapacityExceeded)
 	return rep, nil
 }
 

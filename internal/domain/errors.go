@@ -19,6 +19,10 @@ const (
 	// KindManualReviewPending 实例处于待人工处理冻结态：常规变更被拒，
 	// 必须先经人工显式收口（resolve adopt / resolve discard）。
 	KindManualReviewPending ErrorKind = "manual_review_pending"
+	// KindHostOvercommitted 宿主当前占用总额已经超过配置容量（例如对账重建出
+	// 超大残留），任何会新增占用的准入一律拒绝；但查询、收口等不新增占用的
+	// 命令不受影响。它是"准入策略"拒绝，与内部漂移的 inconsistent_state 明确区分。
+	KindHostOvercommitted ErrorKind = "host_overcommitted"
 )
 
 // OpError 携带可区分的错误类别与上下文。
@@ -113,4 +117,18 @@ func NewManualReviewPendingError(op, id string, rv *Review) error {
 		reason += " (reason=" + string(rv.Reason) + ": " + rv.Detail + ")"
 	}
 	return &OpError{Kind: KindManualReviewPending, Op: op, InstanceID: id, Reason: reason}
+}
+
+// NewHostOvercommittedError 构造"宿主已超卖"准入拒绝错误：
+// 重建占用已超容量时，任何会新增占用的请求都以此类别拒绝（区别于内部不一致）。
+func NewHostOvercommittedError(op, id, resource string, requested, available int64) error {
+	return &OpError{
+		Kind:       KindHostOvercommitted,
+		Op:         op,
+		InstanceID: id,
+		Resource:   resource,
+		Requested:  requested,
+		Available:  available,
+		Reason:     "host already overcommitted beyond configured capacity; new admission rejected (queries and manual resolves stay available)",
+	}
 }

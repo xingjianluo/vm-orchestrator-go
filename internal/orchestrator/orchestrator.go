@@ -308,6 +308,8 @@ func (o *Orchestrator) List(ctx context.Context) ([]*domain.Instance, error) {
 
 // ResourceSnapshot 返回当前配额台账快照。台账是内存权威，与持久化记录的一致性由
 // 进程启动时的 RestoreFromStore（新进程必做）与每次对账后的重建保证。
+// 当宿主被重建出超容量占用时，快照上 OverCommit=true、Available 可能为负：
+// 这是可读、自洽的对账结论（见 reconcile.Report.CapacityExceeded），不是内部错误。
 func (o *Orchestrator) ResourceSnapshot() quota.Snapshot {
 	return o.quota.Snapshot()
 }
@@ -421,8 +423,10 @@ func (o *Orchestrator) resolveAdopt(ctx context.Context, inst *domain.Instance, 
 	}
 
 	if needRegister {
-		// 补登记占用（此前无法计入台账）。先登记再落盘，失败则整体不落定，保持 ManualReview。
-		if err := o.quota.Reserve("resolve.adopt", inst.ID, inst.Spec.Resources); err != nil {
+		// 补登记占用（此前无法计入台账）。这是对"已存在事实"的人工裁决登记，
+		// 不做容量准入（即便宿主已 over-commit 也要让收口落地）；先登记再落盘，
+		// 失败则整体不落定，保持 ManualReview。
+		if err := o.quota.Register("resolve.adopt", inst.ID, inst.Spec.Resources); err != nil {
 			return nil, err
 		}
 	}
@@ -506,21 +510,28 @@ func registerSuffix(registered bool) string {
 func (o *Orchestrator) Reconcile(ctx context.Context, logf func(string, ...any)) (*reconcile.Report, error) {
 	o.adminMu.Lock()
 	defer o.adminMu.Unlock()
-	return reconcile.Run(ctx, o.store, o.backend, func(alive map[string]domain.Resources) (string, error) {
+	return reconcile.Run(ctx, o.store, o.backend, func(alive map[string]domain.Resources) (quota.Snapshot, string, error) {
 		snap, err := o.quota.Rebuild(alive)
 		if err != nil {
-			return "", err
+			return quota.Snapshot{}, "", err
 		}
-		return fmt.Sprintf("capacity={cpu:%d,mem:%d,disk:%d} used={cpu:%d,mem:%d,disk:%d} reservations=%d",
+		detail := fmt.Sprintf("capacity={cpu:%d,mem:%d,disk:%d} used={cpu:%d,mem:%d,disk:%d} reservations=%d",
 			snap.Capacity.CPUMillis, snap.Capacity.MemoryMB, snap.Capacity.DiskMB,
 			snap.Used.CPUMillis, snap.Used.MemoryMB, snap.Used.DiskMB,
-			len(snap.Reservations)), nil
+			len(snap.Reservations))
+		if snap.OverCommit {
+			detail += " OVER-COMMIT exceeded=" + fmt.Sprintf("%v", snap.Exceeded)
+		}
+		return snap, detail, nil
 	}, logf)
 }
 
 // RestoreFromStore 在进程启动时根据持久化记录重建内存配额台账。
-// 它不触碰后端事实（那是 reconcile 的职责），只保证台账与记录一致；
-// 台账重建超出宿主容量时明确报错，而不是截断或静默。
+// 它不触碰后端事实（那是 reconcile 的职责），只保证台账与记录一致。
+//
+// 台账始终按权威集合如实重建：即使重建占用超过宿主容量（例如对账刚落盘的超大
+// 残留），本方法也不报错——超容量通过 ResourceSnapshot().OverCommit 暴露为
+// 告警/准入条件，绝不阻断查询或人工收口。只有记录本身含非法（非正）规格时才报错。
 //
 // 这是"新进程看到的占用与事实一致"的保证：任何新进程在查询占用前必须先执行本方法
 // （CLI 每个子命令默认执行；作为库嵌入时同样应在启动时调用一次）。
@@ -548,7 +559,14 @@ func (o *Orchestrator) RestoreFromStore(ctx context.Context) error {
 	if err != nil {
 		return domain.NewInconsistentStateError("restore", "", err.Error())
 	}
-	o.log("Restore: rebuilt quota ledger from %d resource-holding records; used cpu=%d mem=%d disk=%d",
-		len(want), snap.Used.CPUMillis, snap.Used.MemoryMB, snap.Used.DiskMB)
+	if snap.OverCommit {
+		// 只告警、不失败：超容量是对账结论，不能一票否决本进程的任何命令。
+		o.log("Restore: rebuilt ledger OVER-COMMIT exceeded=%v used cpu=%d mem=%d disk=%d capacity cpu=%d mem=%d disk=%d（人工收口前拒绝新增准入）",
+			snap.Exceeded, snap.Used.CPUMillis, snap.Used.MemoryMB, snap.Used.DiskMB,
+			snap.Capacity.CPUMillis, snap.Capacity.MemoryMB, snap.Capacity.DiskMB)
+	} else {
+		o.log("Restore: rebuilt quota ledger from %d resource-holding records; used cpu=%d mem=%d disk=%d",
+			len(want), snap.Used.CPUMillis, snap.Used.MemoryMB, snap.Used.DiskMB)
+	}
 	return nil
 }

@@ -3,6 +3,8 @@
 // 状态默认保存在 --state-dir（记录）与 --backend-dir（进程承载目录）。
 // 每个子命令在启动时都会先执行一次 RestoreFromStore 重建内存配额台账，
 // 因此无论新起多少个进程、什么时候查询，占用都与持久化记录一致；
+// 即使重建占用超过当前容量（如对账落盘的超大残留），查询/resolve 也照常工作，
+// 超容量只在 quota/reconcile 输出中告警并把新增 create 拒绝为 host_overcommitted。
 // 变更/对账命令还会按需执行对账，把无法自动判定的偏差持久化为 ManualReview，
 // 由 resolve adopt/discard 人工收口。
 package main
@@ -123,6 +125,10 @@ func exitCodeFor(k domain.ErrorKind) int {
 		return 8
 	case domain.KindManualReviewPending:
 		return 9
+	case domain.KindHostOvercommitted:
+		// 宿主占用已超容量（如对账重建出超大残留）：仅拒绝新增占用的准入，
+		// 与资源不足、待人工处理、内部不一致等原因明确区分。
+		return 10
 	default:
 		return 1
 	}
@@ -289,6 +295,12 @@ func run(ctx context.Context, cmd string, args []string, g *globalFlags) error {
 		fmt.Printf("capacity cpu=%d mem=%dMB disk=%dMB\n", snap.Capacity.CPUMillis, snap.Capacity.MemoryMB, snap.Capacity.DiskMB)
 		fmt.Printf("used     cpu=%d mem=%dMB disk=%dMB\n", snap.Used.CPUMillis, snap.Used.MemoryMB, snap.Used.DiskMB)
 		fmt.Printf("avail    cpu=%d mem=%dMB disk=%dMB\n", snap.Available.CPUMillis, snap.Available.MemoryMB, snap.Available.DiskMB)
+		if snap.OverCommit {
+			// 超容量是可读、自洽的对账结论：列表/查询/收口照常工作，
+			// 只有会新增占用的 create 会被 host_overcommitted（退出码 10）拒绝。
+			fmt.Fprintf(os.Stderr, "WARNING: host OVER-COMMIT exceeded=%v (rebuilt usage exceeds capacity; resolve ManualReview instances via resolve adopt/discard)\n",
+				snap.Exceeded)
+		}
 		fmt.Printf("reservations=%d\n", len(snap.Reservations))
 		for id, r := range snap.Reservations {
 			fmt.Printf("  - %s cpu=%d mem=%d disk=%d\n", id, r.CPUMillis, r.MemoryMB, r.DiskMB)
@@ -297,6 +309,8 @@ func run(ctx context.Context, cmd string, args []string, g *globalFlags) error {
 
 	case "reconcile":
 		if err := o.RestoreFromStore(ctx); err != nil {
+			// 超容量已不再是 restore 失败原因（只告警）；到这里说明记录本身非法，
+			// 仍继续执行对账以便暴露/收敛，并把原始问题留在日志里。
 			log.Printf("restore warning: %v (继续执行对账)", err)
 		}
 		rep, err := o.Reconcile(ctx, log.Printf)
@@ -311,8 +325,13 @@ func run(ctx context.Context, cmd string, args []string, g *globalFlags) error {
 			fmt.Printf("- %-16s record=%-10s actual=%-10s outcome=%-11s after=%s\n      action=%s detail=%s\n",
 				v.InstanceID, v.RecordState, v.ActualState, v.Outcome, v.After, v.Action, v.Detail)
 		}
-		fmt.Printf("orphans=%v quarantine=%v quotaConverged=%t\n  %s\n",
-			rep.Orphans, rep.Quarantine, rep.QuotaConverged, rep.QuotaDetail)
+		fmt.Printf("orphans=%v quarantine=%v quotaConverged=%t capacityExceeded=%t exceeded=%v\n  %s\n",
+			rep.Orphans, rep.Quarantine, rep.QuotaConverged, rep.CapacityExceeded, rep.ExceededDimensions, rep.QuotaDetail)
+		if rep.CapacityExceeded {
+			// 超容量只是对账结论，不是失败：本命令仍以 0 退出。
+			fmt.Fprintf(os.Stderr, "WARNING: rebuilt usage exceeds host capacity on %v; queries and resolve stay available, new create is rejected (exit 10) until resolved\n",
+				rep.ExceededDimensions)
+		}
 		return nil
 
 	default:

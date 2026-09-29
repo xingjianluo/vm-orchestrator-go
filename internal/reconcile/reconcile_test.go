@@ -10,6 +10,7 @@ import (
 	"github.com/xingjianluo/vm-orchestrator-go/internal/backend"
 	"github.com/xingjianluo/vm-orchestrator-go/internal/domain"
 	"github.com/xingjianluo/vm-orchestrator-go/internal/orchestrator"
+	"github.com/xingjianluo/vm-orchestrator-go/internal/quota"
 	"github.com/xingjianluo/vm-orchestrator-go/internal/reconcile"
 	"github.com/xingjianluo/vm-orchestrator-go/internal/store"
 )
@@ -57,12 +58,12 @@ func newEnv(t *testing.T, cap domain.Resources) *env {
 func (e *env) reconcile(t *testing.T) *reconcile.Report {
 	t.Helper()
 	rep, err := reconcile.Run(context.Background(), e.st, e.h,
-		func(alive map[string]domain.Resources) (string, error) {
+		func(alive map[string]domain.Resources) (quota.Snapshot, string, error) {
 			snap, err := e.o.Quota().Rebuild(alive)
 			if err != nil {
-				return "", err
+				return quota.Snapshot{}, "", err
 			}
-			return fmt.Sprintf("used={cpu:%d,mem:%d,disk:%d} reservations=%d",
+			return snap, fmt.Sprintf("used={cpu:%d,mem:%d,disk:%d} reservations=%d",
 				snap.Used.CPUMillis, snap.Used.MemoryMB, snap.Used.DiskMB, len(snap.Reservations)), nil
 		}, testLogger(t))
 	if err != nil {
@@ -326,6 +327,41 @@ func TestReconcileOrphanBackend(t *testing.T) {
 	rec2, _ := e.st.Get(ctx, "orphan")
 	if rec2.State != domain.StateManualReview {
 		t.Fatalf("held state must survive repeat reconcile, got %s", rec2.State)
+	}
+}
+
+// TestReconcileCapacityExceeded 无记录的超大后端残留（规格超过整机容量）：
+// 落盘 ManualReview 后，台账按权威集合如实重建，超容量只作为结论
+// （CapacityExceeded）暴露，不再进入 Quarantine、不产生 error。
+func TestReconcileCapacityExceeded(t *testing.T) {
+	ctx := context.Background()
+	e := newEnv(t, domain.Resources{CPUMillis: 2000, MemoryMB: 1024, DiskMB: 2048})
+	huge := specOf(3000, 2048, 4096)
+	if err := e.h.Define(ctx, "huge", huge); err != nil {
+		t.Fatal(err)
+	}
+
+	rep := e.reconcile(t)
+	v := findVerdict(rep, "huge")
+	if v.Outcome != reconcile.OutcomeQuarantined || v.After != "ManualReview" {
+		t.Fatalf("huge must persist ManualReview: %+v", v)
+	}
+	if !rep.QuotaConverged {
+		t.Fatal("ledger must converge even when usage exceeds capacity")
+	}
+	if !rep.CapacityExceeded || len(rep.ExceededDimensions) != 3 {
+		t.Fatalf("capacity exceeded must be reported on all dims: exceeded=%t dims=%v",
+			rep.CapacityExceeded, rep.ExceededDimensions)
+	}
+	for _, q := range rep.Quarantine {
+		if q == "(quota-ledger)" {
+			t.Fatal("over-capacity is a conclusion, not a ledger quarantine entry")
+		}
+	}
+	// 台账如实落地（used 超容量、available 为负、OverCommit=true）。
+	snap := e.o.ResourceSnapshot()
+	if !snap.OverCommit || snap.Used != huge.Resources {
+		t.Fatalf("ledger must honestly reflect oversize residue: %+v", snap)
 	}
 }
 
