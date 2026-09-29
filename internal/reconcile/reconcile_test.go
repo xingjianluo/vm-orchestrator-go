@@ -2,6 +2,7 @@ package reconcile_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"testing"
@@ -10,6 +11,7 @@ import (
 	"github.com/xingjianluo/vm-orchestrator-go/internal/backend"
 	"github.com/xingjianluo/vm-orchestrator-go/internal/domain"
 	"github.com/xingjianluo/vm-orchestrator-go/internal/orchestrator"
+	"github.com/xingjianluo/vm-orchestrator-go/internal/quota"
 	"github.com/xingjianluo/vm-orchestrator-go/internal/reconcile"
 	"github.com/xingjianluo/vm-orchestrator-go/internal/store"
 )
@@ -57,13 +59,21 @@ func newEnv(t *testing.T, cap domain.Resources) *env {
 func (e *env) reconcile(t *testing.T) *reconcile.Report {
 	t.Helper()
 	rep, err := reconcile.Run(context.Background(), e.st, e.h,
-		func(alive map[string]domain.Resources) (string, error) {
+		func(alive map[string]domain.Resources) (reconcile.LedgerResult, error) {
 			snap, err := e.o.Quota().Rebuild(alive)
-			if err != nil {
-				return "", err
+			if errors.Is(err, quota.ErrUsageExceedsCapacity) {
+				return reconcile.LedgerResult{
+					Detail:       fmt.Sprintf("OVER-CAPACITY used=%+v reservations=%d", snap.Used, len(snap.Reservations)),
+					OverCapacity: true,
+				}, nil
 			}
-			return fmt.Sprintf("used={cpu:%d,mem:%d,disk:%d} reservations=%d",
-				snap.Used.CPUMillis, snap.Used.MemoryMB, snap.Used.DiskMB, len(snap.Reservations)), nil
+			if err != nil {
+				return reconcile.LedgerResult{}, err
+			}
+			return reconcile.LedgerResult{
+				Detail: fmt.Sprintf("used={cpu:%d,mem:%d,disk:%d} reservations=%d",
+					snap.Used.CPUMillis, snap.Used.MemoryMB, snap.Used.DiskMB, len(snap.Reservations)),
+			}, nil
 		}, testLogger(t))
 	if err != nil {
 		t.Fatalf("reconcile: %v", err)
@@ -433,4 +443,49 @@ func TestReconcileMixedDeterministic(t *testing.T) {
 	}
 	t.Logf("[snapshot] mixed reconcile settled: used=%+v reservations=%d manualReview=%v",
 		snap.Used, len(snap.Reservations), rep.ManualReviewIDs)
+}
+
+// TestReconcileOversizedOrphanAdvisory 对账发现声明规格超过本机容量的孤儿残留时：
+// 超容量只是报告级告警（QuotaOverCapacity=true、台账仍 Converged、不进 Quarantine），
+// 台账按权威集合落账且自洽，实例记录落盘为 ManualReview 等待人工收口。
+func TestReconcileOversizedOrphanAdvisory(t *testing.T) {
+	ctx := context.Background()
+	cap := domain.Resources{CPUMillis: 2000, MemoryMB: 1024, DiskMB: 2048}
+	e := newEnv(t, cap)
+	normal := specOf(1000, 512, 1024)
+	huge := specOf(9000, 1, 1) // 单实例 CPU 超过整机容量
+	if _, err := e.o.Create(ctx, "normal", "normal", normal); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.h.Define(ctx, "huge", huge); err != nil {
+		t.Fatal(err)
+	}
+
+	rep := e.reconcile(t)
+	if !rep.QuotaConverged {
+		t.Fatal("ledger must still converge (rebuild applied) when over capacity")
+	}
+	if !rep.QuotaOverCapacity {
+		t.Fatalf("oversized rebuild must be reported as advisory: %s", rep.QuotaDetail)
+	}
+	for _, q := range rep.Quarantine {
+		if q == "(quota-ledger)" {
+			t.Fatal("over-capacity must not be treated as a ledger failure")
+		}
+	}
+	if v := findVerdict(rep, "huge"); v.Outcome != reconcile.OutcomeQuarantined || v.After != "ManualReview" {
+		t.Fatalf("huge orphan must be held as ManualReview: %+v", v)
+	}
+	// 台账按事实落账：used == normal + huge，且自洽。
+	snap := e.o.ResourceSnapshot()
+	wantUsed := domain.Resources{CPUMillis: 10000, MemoryMB: 513, DiskMB: 1025}
+	if snap.Used != wantUsed {
+		t.Fatalf("ledger must reflect both records: got %+v want %+v", snap.Used, wantUsed)
+	}
+	if !snap.OverCapacity || snap.OverBy.CPUMillis != 8000 {
+		t.Fatalf("snapshot over-capacity flags wrong: %+v", snap)
+	}
+	if len(snap.Reservations) != 2 {
+		t.Fatalf("both instances must be reserved exactly once: %+v", snap.Reservations)
+	}
 }

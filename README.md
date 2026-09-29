@@ -116,26 +116,68 @@ cmd/vmguest/           进程后端承载的 guest 程序（SIGTERM 优雅退出
 
 不变量：
 
-1. `used == 所有预留之和`；`available = capacity - used`，任何维度不允许超额。
+1. `used == 所有预留之和`；`available = capacity - used`。台账**永远自洽**：
+   即使 `used` 超过 `capacity`（见下方「重建超过当前容量」一节），`used` 仍精确等于
+   全部预留之和，此时 `available` 对应维度为负、快照显式带 `over_capacity=true` 与
+   逐维 `over_by`，读数完全可解释。
 2. **准入先于副作用**：`create` 的顺序严格为
    `参数校验 → 查记录 → quota.Reserve → backend.Define → 持久化 Defined`。
    资源不足时在触碰后端/磁盘之前直接返回 `insufficient_resource`，错误中带
-   `resource=<维度>(requested, available)`。
+   `resource=<维度>(requested, available)`。**在线准入路径绝不制造超卖**——
+   哪怕当前是「重建带入的超容量」状态，任何新 `create` 仍被这样拒绝。
 3. **失败必回滚**：`backend.Define` 失败 → 释放刚预留的配额；持久化失败 →
    撤销后端定义并释放配额。任何失败路径后 `used` 都回到调用前水平。
 4. **重复释放即漂移信号**：`Release` 必须对应一次 `Reserve`，无台账记录时返回错误，
    由编排层包装成 `inconsistent_state` 暴露，而不是静默忽略。
 5. **销毁才释放 / 待人工处理继续计入**：`Stopped`（含崩溃收敛而来）仍持有配额；
    **ManualReview 在人工收口前也继续按规格占用**（口径见下）；只有收敛到 `Destroyed`
-   或人工 `resolve discard` 才释放。`vmctl quota` 可查看 capacity/used/available
-   与逐实例预留台账。
+   或人工 `resolve discard` 才释放。`vmctl quota` 可查看 capacity/used/available、
+   `over_capacity/over_by` 与逐实例预留台账。
 6. **重启重建（跨进程一致的关键）**：配额台账是内存结构，进程退出即消失。
    `RestoreFromStore` 依据**所有持有资源状态的持久化记录**（Defined/Running/Stopped/
-   ManualReview，Destroyed 除外）重建内存台账；若重建结果超容量，明确报错而不是截断。
+   ManualReview，Destroyed 除外）重建内存台账；**重建后即使总额超过当前容量，
+   台账也照常按权威集合重建完成**，超容量只作为告警暴露（详见下节），绝不阻断查询与
+   人工收口；只有真正的数据损坏（如非正规格）才报错。
    **CLI 的每个子命令在执行前都会先跑一次 RestoreFromStore**，因此无论何时、新起几个
    进程去 `quota / get / list`，看到的占用都等于「真正持有资源的记录集合」之和，不会
    出现实例占着却显示 0 或漏算。作为库嵌入时，应在编排器启动后、查询/变更前调用一次
    `RestoreFromStore`。
+
+### 重建占用超过当前容量（advisory，不是错误开关）
+
+典型场景：磁盘后端目录里存在一个**没有任何记录对应**的承载残留（孤儿），而它自己声明
+的规格（`spec.json`）比这台机器当前配置的容量还大；或者任何「按落盘记录重建后的占用
+总额会超过当前容量」的既成事实（例如容量配置被调低、机器被缩配）。
+
+系统对此的口径是：**超容量是一种对账结论/告警，不是内部状态不一致，更不是一票否决所有
+命令的开关。**
+
+- 台账（`used` 与逐实例预留）仍按权威集合**照实重建并落账**，
+  `used == Σ(所有未 Destroyed 且规格可知的记录的规格)` 恒成立，读数自洽、可解释；
+  快照额外带 `over_capacity=true` 与逐维 `over_by`，`available` 对应维度如实显示负值。
+- **查询侧完全正常**：`get / list / quota / reviews` 在超容量期间照常返回结果，
+  换任何一个新进程（每个进程启动都先 `RestoreFromStore`）读数一致，不再返回
+  `inconsistent_state`（退出码 8）。退出码 8 只保留给真正的内部漂移/数据损坏。
+- **人工收口始终可用**：
+  - `resolve adopt`：确认继续存在 → 承载收敛到 `Defined/Running/Stopped`，
+    review 清空、落确定态；占用保持与记录一致（不重不漏）。若确认后仍超容量，
+    告警继续保留，直到容量调高或实例被清理；
+  - `resolve discard`：确认清理 → 幂等 Undefine 残留、从台账释放该实例、落
+    `Destroyed` 墓碑；释放后若总额回到容量以内，告警自然消失。
+  - 规格不可读孤儿的 `--claim` 补报同样**不走容量准入**（那是对既成事实的人工确认
+    登记，走 `quota.Register`），补报后是否超容量由快照如实暴露。
+  收口完成后换任意新进程再查，记录与占用都一致，不会算漏或算重。
+- **真正会导致超卖的新建/准入仍然拒绝**：超容量期间 `create` 一律返回
+  `insufficient_resource`（退出码 6，错误带 `requested/available`，available 为负值），
+  拒绝前不触碰后端与磁盘。它与 `manual_review_pending`（9）、`not_found`（3）、
+  `illegal_transition`（5）等既有原因清楚区分。
+- **其它不相关实例不受牵连**：超容量残留只影响它自己的裁决与全局「是否还能新建」；
+  无关实例的 `get/start/stop/destroy/resolve` 全部照常。
+- 告警在哪里看到：`vmctl reconcile` 报告 `quotaConverged=true, overCapacity=true`
+  （JSON 中为 `quota_over_capacity`）；`vmctl quota` 输出
+  `*** OVER CAPACITY (advisory) ... overBy ... ***`（JSON 快照带
+  `over_capacity/over_by`）。超容量**不会**出现在 reconcile 的 `quarantine` 列表里——
+  quarantine 只装真正需要人工/无法处理的项（ManualReview 实例、台账重建的硬失败）。
 
 ### 待人工处理实例的占用口径（务必知晓）
 
@@ -183,7 +225,11 @@ Defined / Running / Stopped / **ManualReview** 为真，Destroyed 为假）。
 配额台账在对账后以「**持有资源状态**」的记录为权威集合**重建**：
 收敛到 Destroyed 的实例配额随之释放；ManualReview（含新建的孤儿记录，规格可知时）
 **继续计入**；只有无记录且读不出规格的孤儿不进台账并显式列入 `UnaccountedOrphans`。
-台账重建若超过宿主容量，结论中标记 `quota-ledger` 隔离且 `QuotaConverged=false`。
+台账重建总是完成（`QuotaConverged=true`）；若重建总额超过当前宿主容量，**不报错、
+不隔离、不阻断任何命令**，只在报告中标记 `QuotaOverCapacity=true`（CLI 文本输出
+`overCapacity=true`，JSON 为 `quota_over_capacity`）作为告警；只有真正的台账硬失败
+（如规格数据非法）才标记 `quota-ledger` 隔离且 `QuotaConverged=false`。各命令在超容量
+下的具体表现见第二节「重建占用超过当前容量」。
 
 ### 人工收口（resolve）
 
@@ -273,6 +319,17 @@ go test ./internal/backend/ -v              # 真实子进程：探活、跨重�
   （`TestCrossProcessUsageConsistency`）；
 - 无 `spec.json` 孤儿不进台账，无 claim 的 adopt 被拒，带 `--claim` 补报后才登记
   （`TestResolveUnknownSpecOrphan`）；
+- **重建超容量整条链路**：声明规格大于整机容量的后端孤儿（及任何重建后超容量的已落盘
+  情况）→ 对账只报 `overCapacity` 告警、台账仍 converged 且不进 quarantine →
+  换新进程 `get/list/quota/reviews` 全部可用、`used==Σ预留` 自洽并带 `over_by` →
+  无关实例 start/stop 不被牵连 → 新 `create` 仍以 `insufficient_resource` 拒绝且零副作用、
+  与 not_found/already_exists/manual_review_pending 清楚区分 → 人工 `discard`
+  （清残留、释放、落墓碑）或 `adopt`（落确定态、占用与事实一致）始终可落地 →
+  再换进程记录与占用一致、不重不漏（`TestOversizedOrphanQueriesSurviveAndDiscardResolves`、
+  `TestOversizedOrphanAdoptLandsDeterministic`、
+  `TestOversizedPersistedRecordRestoresAsAdvisory`、
+  `TestOversizedUnknownSpecOrphanClaimAdopt`、`TestReconcileOversizedOrphanAdvisory`、
+  `TestRebuildBeyondCapacityIsAdvisory`）；
 - 对账：guest 崩溃、Start 崩溃窗口、半完成销毁、Running 但后端消失（持久化挂起）、
   孤儿残留（落盘挂起、保留不删）、墓碑残留（幂等清理）、重复对账保持冻结、混合矩阵 + 配额守恒。
 
@@ -304,6 +361,31 @@ bin/vmctl resolve discard web --note "wipe confirmed"
 bin/vmctl quota              # discard 后占用释放
 ```
 
+模拟「超出当前容量的后端残留」（用小容量 + 手工落一个大规格残留目录）：
+
+```bash
+go build -o bin/vmctl ./cmd/vmctl
+CAP="--capacity-cpu 2000 --capacity-mem 1024 --capacity-disk 2048"
+bin/vmctl create normal $CAP --cpu 1000 --mem 512 --disk 1024
+# 直接在后端承载目录造一个没有任何记录、规格超过整机容量的残留：
+mkdir -p var/run/huge
+echo '{"resources":{"cpu_millis":9000,"memory_mb":512,"disk_mb":1024},"image":"img"}' \
+  > var/run/huge/spec.json
+
+bin/vmctl reconcile $CAP     # huge -> ManualReview；quotaConverged=true overCapacity=true
+bin/vmctl list    $CAP       # 正常列出 huge(ManualReview) 与 normal，绝不报 inconsistent_state
+bin/vmctl get huge $CAP      # 单实例查询正常，带 review 原因
+bin/vmctl reviews $CAP       # 待人工处理清单正常
+bin/vmctl quota   $CAP       # used=10000/2000、avail cpu=-8000、*** OVER CAPACITY ... overBy cpu=8000 ***
+bin/vmctl start normal $CAP  # 无关实例照常变更
+bin/vmctl create x $CAP --cpu 1 --mem 1 --disk 1   # 退出码 6：insufficient_resource（超卖准入关闭）
+bin/vmctl start huge $CAP    # 退出码 9：manual_review_pending（原因仍可区分）
+bin/vmctl resolve discard huge $CAP --note "wipe"  # 人工收口始终可用：清残留+释放+墓碑
+bin/vmctl quota   $CAP       # over-capacity 告警消失，只剩 normal 的占用
+# 也可以确认继续存在（占用与事实一致，若仍超容量则告警保留）：
+# bin/vmctl resolve adopt huge --to Stopped
+```
+
 标志可放在位置参数前后任意位置（CLI 内部会重排）。失败时 stderr 输出
 `kind=<类别>` 并以不同退出码区分原因，便于脚本判定（ManualReview 为 9）。
 
@@ -331,6 +413,27 @@ bin/vmctl quota              # discard 后占用释放
   这是一处有意的口径收紧：保证「待人工处理」跨进程可见、且其资源在裁决前不被再次分配。
   受影响的自动化若依赖旧报告字段 `After="quarantined-*"`，需改为识别
   `After="ManualReview"` 与记录上的 `state/review`；占用读数会把这些实例包含进来。
+- **「重建占用超过当前容量」从硬错误改为告警（本次修正，请注意）**：旧版 `Rebuild`
+  在总额超容量时拒绝落账，`RestoreFromStore` 因而返回 `inconsistent_state`，导致从那次
+  对账起 `list/get/quota/reviews/resolve` 全部以退出码 8 失败、人工收口也无法落地。
+  新版在这种情况下**仍按权威集合重建台账**：
+  - 对既有落盘记录**完全兼容、无需迁移**：旧版在该场景下卡在「记录已落盘 ManualReview、
+    台账却建不起来」的状态；新版进程启动时 `RestoreFromStore` 会直接把这些记录正常计入
+    （ManualReview 且规格可知即计入），系统立刻恢复可查、可收口；
+  - 程序接口：`quota.Pool.Rebuild` 超容量时返回
+    `(Snapshot, errors.Join 包装的 quota.ErrUsageExceedsCapacity)`，且 **Snapshot 已反映
+    新台账**（不再是零值、台账也不再保持旧值）；请用 `errors.Is(err,
+    quota.ErrUsageExceedsCapacity)` 识别为告警。`quota.Snapshot` 新增
+    `over_capacity` / `over_by` 两个 JSON 字段（旧消费者忽略即可）；
+  - `reconcile.LedgerRebuilder` 签名改为返回 `reconcile.LedgerResult{Detail,
+    OverCapacity}`：超容量走 `OverCapacity=true` 而**不是** error；`Report` 新增
+    `quota_over_capacity` 字段，超容量也**不再**向 `Quarantine` 追加
+    `"(quota-ledger)"`（该标记只保留给真正的台账硬失败）。依赖旧 `Quarantine` 中
+    `"(quota-ledger)"` 来识别超容量的自动化需改读 `QuotaOverCapacity`；
+  - 人工认领补报规格从 `Reserve`（受容量准入限制）改为 `quota.Register`（事实补登记，
+    不受容量开关限制），保证超大孤儿也能人工认领；
+  - `inconsistent_state`（退出码 8）语义收窄：只用于真正的占用漂移/数据损坏
+    （如重复释放、非正规格导致的台账重建失败），不再用于「事实占用超过配置容量」。
 - **台账口径**统一收敛为 `State.HoldsResources()`：`RestoreFromStore` 与对账重建
   使用同一权威集合，避免「启动恢复」与「对账重建」两套口径不一致。
 - 作为库嵌入的调用方：旧代码无需改构造函数；但要获得「新进程占用即一致」的保证，

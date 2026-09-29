@@ -17,6 +17,10 @@
 // ManualReview 实例在收口前继续按规格占用，防止资源被再次分配；收口到具体正常状态后
 // 占用保持，收口到 Destroyed 后释放。唯一例外：无记录且后端读不出规格的孤儿，
 // 无法知道该占多少，台账无法计入（报告与日志显式标出），需人工收口时补报规格。
+//
+// 重建后总额超过当前容量（如存在规格大于本机容量的孤儿）属于告警级结论：台账仍按权威
+// 集合重建（QuotaConverged=true），通过 Report.QuotaOverCapacity 暴露，不进 Quarantine、
+// 不返回错误、不阻断任何命令；在线新增准入仍由配额池按容量拒绝。
 package reconcile
 
 import (
@@ -55,19 +59,35 @@ type Report struct {
 	Verdicts []Verdict
 	// Orphans 是后端存在但没有任何记录对应的承载残留（首次发现时已落盘为 ManualReview）。
 	Orphans []string
-	// Quarantine 包含所有需人工处理的 id（含已持久化的 ManualReview、孤儿、台账问题）。
+	// Quarantine 包含需人工处理的 id（含已持久化的 ManualReview、孤儿）以及
+	// 真正的台账重建失败（数据损坏）。注意：「重建占用超过当前容量」**不进**这里，
+	// 它是告警级结论，见 QuotaOverCapacity。
 	Quarantine []string
 	// ManualReviewIDs 是当前处于 ManualReview 冻结态的实例（结论已随记录持久化）。
 	ManualReviewIDs []string
 	// UnaccountedOrphans 是无记录且后端读不出规格、无法计入占用台账的孤儿 id。
 	UnaccountedOrphans []string
-	// QuotaConverged 表示配额台账已按权威集合重建。
+	// QuotaConverged 表示配额台账已按权威集合重建（即便重建结果超过容量，
+	// 台账也已落账并自洽；此时 QuotaOverCapacity=true 作为告警暴露）。
 	QuotaConverged bool
-	QuotaDetail    string
+	// QuotaOverCapacity 表示按权威集合重建后的占用总额超过当前宿主容量。
+	// 这是对账结论/告警：不否决任何命令，查询与人工收口照常，
+	// 新增准入仍由配额池按容量拒绝（insufficient_resource）。
+	QuotaOverCapacity bool
+	QuotaDetail       string
+}
+
+// LedgerResult 是台账重建的结果：台账总是先按权威集合落账，
+// OverCapacity 仅表示落账后总额超过容量（告警，不是失败）。
+type LedgerResult struct {
+	Detail       string
+	OverCapacity bool
 }
 
 // LedgerRebuilder 以"仍存活实例的配额集合"重建配额台账，返回人类可读的快照描述。
-type LedgerRebuilder func(alive map[string]domain.Resources) (string, error)
+// 返回 error 仅用于真正的损坏（如非正规格）；超容量必须通过 LedgerResult.OverCapacity
+// 作为告警暴露，且台账已经完成重建。
+type LedgerRebuilder func(alive map[string]domain.Resources) (LedgerResult, error)
 
 // Logf 输出对账过程中的操作序列与结论。
 type Logf func(format string, args ...any)
@@ -187,21 +207,29 @@ func Run(
 		alive[r.ID] = r.Spec.Resources
 	}
 	if rebuildLedger != nil {
-		detail, err := rebuildLedger(alive)
+		res, err := rebuildLedger(alive)
 		if err != nil {
+			// 真正的台账损坏（如非正规格）：保持旧台账不动并隔离上报。
 			rep.QuotaDetail = "ledger rebuild rejected: " + err.Error()
 			logf("[reconcile] QUOTA DRIFT: %s", rep.QuotaDetail)
 			rep.Quarantine = append(rep.Quarantine, "(quota-ledger)")
 		} else {
 			rep.QuotaConverged = true
-			rep.QuotaDetail = detail
-			logf("[reconcile] quota ledger CONVERGED held=%d snapshot=%s", len(alive), detail)
+			rep.QuotaDetail = res.Detail
+			rep.QuotaOverCapacity = res.OverCapacity
+			if res.OverCapacity {
+				// 告警级结论：台账已按权威集合落账且自洽，只是总额超过当前容量。
+				// 不隔离、不否决任何命令；新增准入继续由配额池拒绝。
+				logf("[reconcile] QUOTA OVER CAPACITY (advisory, ledger consistent): %s", res.Detail)
+			} else {
+				logf("[reconcile] quota ledger CONVERGED held=%d snapshot=%s", len(alive), res.Detail)
+			}
 		}
 	}
 
-	logf("[reconcile] DONE matched=%d recovered=%d quarantined=%d orphans=%d manualReview=%d quotaConverged=%t",
+	logf("[reconcile] DONE matched=%d recovered=%d quarantined=%d orphans=%d manualReview=%d quotaConverged=%t overCapacity=%t",
 		rep.count(OutcomeMatched), rep.count(OutcomeRecovered), rep.count(OutcomeQuarantined),
-		len(rep.Orphans), len(rep.ManualReviewIDs), rep.QuotaConverged)
+		len(rep.Orphans), len(rep.ManualReviewIDs), rep.QuotaConverged, rep.QuotaOverCapacity)
 	return rep, nil
 }
 

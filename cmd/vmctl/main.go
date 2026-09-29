@@ -289,6 +289,13 @@ func run(ctx context.Context, cmd string, args []string, g *globalFlags) error {
 		fmt.Printf("capacity cpu=%d mem=%dMB disk=%dMB\n", snap.Capacity.CPUMillis, snap.Capacity.MemoryMB, snap.Capacity.DiskMB)
 		fmt.Printf("used     cpu=%d mem=%dMB disk=%dMB\n", snap.Used.CPUMillis, snap.Used.MemoryMB, snap.Used.DiskMB)
 		fmt.Printf("avail    cpu=%d mem=%dMB disk=%dMB\n", snap.Available.CPUMillis, snap.Available.MemoryMB, snap.Available.DiskMB)
+		if snap.OverCapacity {
+			// 告警级结论：台账自洽（used==Σ预留），只是落盘事实占用超过了当前配置容量。
+			// 不影响查询/收口；新的 create 准入仍会以 insufficient_resource（退出码 6）拒绝。
+			fmt.Printf("*** OVER CAPACITY (advisory): rebuilt usage exceeds host capacity; overBy cpu=%d mem=%dMB disk=%dMB ***\n",
+				snap.OverBy.CPUMillis, snap.OverBy.MemoryMB, snap.OverBy.DiskMB)
+			fmt.Printf("    ledger is self-consistent; resolve oversized ManualReview residues (adopt/discard) or raise host capacity\n")
+		}
 		fmt.Printf("reservations=%d\n", len(snap.Reservations))
 		for id, r := range snap.Reservations {
 			fmt.Printf("  - %s cpu=%d mem=%d disk=%d\n", id, r.CPUMillis, r.MemoryMB, r.DiskMB)
@@ -311,8 +318,11 @@ func run(ctx context.Context, cmd string, args []string, g *globalFlags) error {
 			fmt.Printf("- %-16s record=%-10s actual=%-10s outcome=%-11s after=%s\n      action=%s detail=%s\n",
 				v.InstanceID, v.RecordState, v.ActualState, v.Outcome, v.After, v.Action, v.Detail)
 		}
-		fmt.Printf("orphans=%v quarantine=%v quotaConverged=%t\n  %s\n",
-			rep.Orphans, rep.Quarantine, rep.QuotaConverged, rep.QuotaDetail)
+		fmt.Printf("orphans=%v quarantine=%v quotaConverged=%t overCapacity=%t\n  %s\n",
+			rep.Orphans, rep.Quarantine, rep.QuotaConverged, rep.QuotaOverCapacity, rep.QuotaDetail)
+		if rep.QuotaOverCapacity {
+			fmt.Println("  *** QUOTA OVER CAPACITY: advisory conclusion only; queries and resolve stay available, new admission stays rejected (exit code 6) ***")
+		}
 		return nil
 
 	default:
